@@ -1,0 +1,2 @@
+# LTE_mod_controll_board
+LTEモジュールを制御するESP32-C6を使った簡易制御ボードの回路図・Arduinoソース
