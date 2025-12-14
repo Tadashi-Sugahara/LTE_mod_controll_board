@@ -74,6 +74,15 @@ int cursorX = margin;
 int cursorY = margin;
 int lineHeight = 0;
 int textSize   = 1;
+int responseLineCount = 0;  // レスポンス行数をカウント
+
+// タイムアウト管理用変数
+unsigned long commandSentTime = 0;
+unsigned long gpio20LowTime = 0;
+bool waitingForResponse = false;
+bool gpio20IsLow = false;
+const unsigned long RESPONSE_TIMEOUT_MS = 10000;  // 10秒
+const unsigned long GPIO20_LOW_DURATION_MS = 1000; // 1秒
 
 // 画面クリア＆ホーム（タイトル再描画オプション付き）
 void lcdClearBeforeNewLine(bool drawHeader = true) {
@@ -195,6 +204,11 @@ void setup() {
   Serial.begin(BAUD_PC);
   delay(300);
 
+  // GPIO20を出力モードに設定してHIGHにする
+  pinMode(20, OUTPUT);
+  digitalWrite(20, HIGH);
+  Serial.println("[GPIO20] Set to HIGH");
+
   // UART1 (9600, 8N1, TX=18, RX=19)
   Serial1.begin(BAUD_UART, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
   Serial1.setRxBufferSize(2048);
@@ -217,12 +231,32 @@ void setup() {
 }
 
 void loop() {
+  // GPIO20の状態管理
+  if (gpio20IsLow && (millis() - gpio20LowTime >= GPIO20_LOW_DURATION_MS)) {
+    // 1秒経過したらGPIO20をHIGHに戻す
+    digitalWrite(20, HIGH);
+    gpio20IsLow = false;
+    Serial.println("[GPIO20] Set to HIGH (timeout recovery)");
+  }
+  
+  // レスポンスタイムアウト監視
+  if (waitingForResponse && (millis() - commandSentTime >= RESPONSE_TIMEOUT_MS)) {
+    // 10秒以上レスポンスがない場合
+    Serial.println("[TIMEOUT] No response for 10 seconds - Resetting GPIO20");
+    digitalWrite(20, LOW);
+    gpio20LowTime = millis();
+    gpio20IsLow = true;
+    waitingForResponse = false;
+    Serial.println("[GPIO20] Set to LOW (timeout)");
+  }
+
   // 1) PCから1行受信（LF終端）
   String line = pcReadLine();
 
   if (line.length() > 0) {
     // 2) 表示前にクリア関数を実行（先頭から描画）
     lcdClearBeforeNewLine(/*drawHeader=*/true);
+    responseLineCount = 0;  // レスポンス行数をリセット
 
     // 3) LCDへ行表示
     lcdPrintLine(line);
@@ -231,16 +265,28 @@ void loop() {
     Serial.print("[TX->UART1] "); Serial.println(line);
     Serial1.write((const uint8_t*)line.c_str(), line.length());
     Serial1.write('\r'); // LF終端
+    
+    // タイムアウト監視開始
+    commandSentTime = millis();
+    waitingForResponse = true;
   }
 
-  // 5) UART1_RX のレスポンス行をPCへ表示（UTF-8としてそのまま）
+  // 5) UART1_RX のレスポンス行をPCとLCDに表示（UTF-8としてそのまま）
   String resp;
   if (uart1GetLine(resp)) {
     Serial.print("[RX<-UART1] ");
     Serial.println(resp);
-  }
-  if (uart1GetLine(resp)) {
-    Serial.print("[RX<-UART1] ");
-    Serial.println(resp);
+    responseLineCount++;
+    
+    // レスポンスを受信したのでタイムアウト監視を停止
+    if (responseLineCount >= 2) {
+      waitingForResponse = false;
+    }
+    
+    if (responseLineCount == 2) {
+      // 2回目のレスポンスのみLCDに表示
+      lcdPrintLine(">" + resp);
+    }
+    // 1回目のレスポンスはLCDに表示しない
   }
 }

@@ -118,15 +118,14 @@ void putCharLCD(char c) {
     newLine();
   }
   lineBuf += c;
+  
+  // 文字を追加したら即座に表示して結果を確認できるようにする
+  flushLine();
 }
 
 //==================== Arduino標準関数 ====================
 void setup() {
-  // USB CDC 初期化
-  Serial.begin(115200);
-  delay(300); // CDC初期化待ち（IDEのシリアルモニタ接続タイミング対策）
-
-  // LCD初期化
+  // LCD初期化を先に行う（視覚的確認のため）
   lcd.begin();
   lcd.setRotation(1);           // 横表示（論理座標: 320x172）
   lcd.setBrightness(220);
@@ -138,11 +137,62 @@ void setup() {
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setTextDatum(textdatum_t::top_left);
 
-  // 行高さはフォント＋倍率で計算（getTextSizeは無いのでtextSizeを使用）
+  // 行高さはフォント＋倍率で計算
   lineHeight = lcd.fontHeight() * textSize;
 
+  // LCD初期表示
+  lcd.setCursor(margin, margin);
+  lcd.println("ESP32-C6 LCD Test");
+  cursorY = margin + lineHeight;
+  lcd.setCursor(margin, cursorY);
+  lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.println("Initializing Serial...");
+  cursorY += lineHeight;
+  
+  // USB CDC 初期化
+  Serial.begin(115200);
+  
+  // Serial初期化待ち（最大10秒）
+  lcd.setCursor(margin, cursorY);
+  lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+  lcd.println("Waiting for Serial...");
+  cursorY += lineHeight;
+  
+  unsigned long startTime = millis();
+  while (!Serial && (millis() - startTime < 10000)) {
+    delay(100);
+    lcd.setCursor(margin, cursorY);
+    lcd.printf("Wait: %ds", (millis() - startTime) / 1000);
+  }
+  
+  if (Serial) {
+    lcd.setCursor(margin, cursorY);
+    lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+    lcd.println("Serial: OK       ");
+    cursorY += lineHeight;
+    
+    Serial.println("\n=== ESP32-C6 LCD Serial Test Start ===");
+    Serial.println("LCD initialization completed successfully!");
+    Serial.println("Send characters via serial monitor to display on LCD");
+    Serial.println("Baud rate: 115200");
+    Serial.println("Type 'test' to run a test sequence");
+    Serial.println("======================================\n");
+  } else {
+    lcd.setCursor(margin, cursorY);
+    lcd.setTextColor(TFT_RED, TFT_BLACK);
+    lcd.println("Serial: FAILED!");
+    cursorY += lineHeight;
+  }
+  
+  // 最終的な画面クリアと準備
+  delay(2000);
+  lcd.fillScreen(TFT_BLACK);
+  cursorX = margin;
+  cursorY = margin;
+  
   // タイトル行
   lcd.setCursor(margin, margin);
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.println("UART->LCD Echo  (Font4)");
   cursorY = margin + lineHeight;
   cursorX = margin;
@@ -151,8 +201,104 @@ void setup() {
 }
 
 void loop() {
+  static unsigned long lastDebugTime = 0;
+  static unsigned long lastHeartbeat = 0;
+  static int charCount = 0;
+  static int heartbeatCount = 0;
+  static String inputBuffer = "";
+  
+  // ハートビート表示（1秒ごと）
+  if (millis() - lastHeartbeat > 1000) {
+    heartbeatCount++;
+    if (Serial) {
+      Serial.printf("[HEARTBEAT %d] Waiting for input... (Type 'test' for demo)\n", heartbeatCount);
+    }
+    lastHeartbeat = millis();
+  }
+  
+  // 受信文字を処理
   while (Serial.available()) {
     char c = (char)Serial.read();
+    charCount++;
+    
+    // 受信文字をPC側にエコーバック（そのまま）
+    Serial.write(c);
+    
+    // 受信文字をLCDに表示
     putCharLCD(c);
+    
+    // 改行文字をチェックしてコマンド処理
+    if (c == '\n' || c == '\r') {
+      if (inputBuffer.length() > 0) {
+        // 特別なコマンドの処理
+        if (inputBuffer.equals("test")) {
+          Serial.println("\n[Executing test command...]");
+          runTestSequence();
+        } else if (inputBuffer.equals("clear")) {
+          lcd.fillScreen(TFT_BLACK);
+          cursorX = margin;
+          cursorY = margin;
+          Serial.println("\n[LCD cleared]");
+        }
+        inputBuffer = "";
+      }
+    } else {
+      inputBuffer += c;
+    }
   }
+  
+  // 10秒ごとに詳細な状態情報を表示
+  if (millis() - lastDebugTime > 10000) {
+    Serial.println("\n=== STATUS REPORT ===");
+    Serial.printf("Total chars received: %d\n", charCount);
+    Serial.printf("LCD cursor at (%d, %d)\n", cursorX, cursorY);
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Uptime: %lu ms\n", millis());
+    Serial.println("Commands: 'test', 'clear'");
+    Serial.println("====================\n");
+    lastDebugTime = millis();
+  }
+}
+
+// テストシーケンス実行
+void runTestSequence() {
+  Serial.println("\n=== RUNNING TEST SEQUENCE ===");
+  
+  // LCD画面クリア
+  lcd.fillScreen(TFT_BLACK);
+  cursorX = margin;
+  cursorY = margin;
+  
+  // カラーテスト
+  lcd.setTextColor(TFT_RED, TFT_BLACK);
+  lcd.setCursor(margin, margin);
+  lcd.println("RED TEXT");
+  
+  lcd.setTextColor(TFT_GREEN, TFT_BLACK);
+  lcd.setCursor(margin, margin + lineHeight);
+  lcd.println("GREEN TEXT");
+  
+  lcd.setTextColor(TFT_BLUE, TFT_BLACK);
+  lcd.setCursor(margin, margin + lineHeight * 2);
+  lcd.println("BLUE TEXT");
+  
+  lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  lcd.setCursor(margin, margin + lineHeight * 3);
+  lcd.println("YELLOW TEXT");
+  
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  lcd.setCursor(margin, margin + lineHeight * 4);
+  lcd.println("Serial communication OK!");
+  
+  Serial.println("Color test completed on LCD");
+  Serial.println("If you see colored text on LCD, communication is working!");
+  Serial.println("========================\n");
+  
+  delay(3000);
+  
+  // 通常表示に戻す
+  lcd.fillScreen(TFT_BLACK);
+  cursorX = margin;
+  cursorY = margin;
+  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
 }
