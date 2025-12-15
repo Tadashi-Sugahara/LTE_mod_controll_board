@@ -1,19 +1,21 @@
 
 /*
- * ESP32-C6: PCから受信した文字列を行単位にまとめてUART1(TX=GP18, RX=GP19, 9600bps)へ送信
- *           LCDは表示前にクリアして先頭から描画
- *           UART1_RXで受信したレスポンス行をPCのシリアル(USB-CDC)へ表示
+ * ESP32-C6: LittleFSのcommands1.txtからATコマンドを順次読み込み、UART1経由で送信
+ *           "#"で始まる行はスキップ、LCDに実行コマンドを表示、レスポンスをPCに表示
+ *           レスポンス受信完了後にLCDをクリアして次のコマンドを実行
  *
- * - PC(USB CDC, Serial 115200)からLF終端の1行を受信
- * - 表示直前に lcdClearBeforeNewLine() を実行して画面クリア＆ホーム
- * - 受信行をLCDに1行表示
- * - 受信行を UTF-8 のまま LF('\n') 終端で UART1 に送信
- * - UART1のレスポンスは LF で行確定（LFが無い機器は受信ギャップで確定）→ PCへ表示
+ * - LittleFSのcommands1.txtから1行ずつATコマンドを読み込み
+ * - "#"で始まる行（コメント行）はスキップ
+ * - LCDに実行するATコマンドを表示
+ * - ATコマンドをUART1(TX=GPIO18, RX=GPIO19)に送信
+ * - UART1のレスポンスをPCのシリアル(USB-CDC)に表示
+ * - レスポンス受信完了後、LCDをクリアして次のコマンドを実行
  *
- * UART1: TX=GPIO18, RX=GPIO19, 9600bps, 8N1
+ * UART1: TX=GPIO18, RX=GPIO19, 115200bps, 8N1
  */
 
 #include <LovyanGFX.hpp>
+#include <LittleFS.h>
 
 //==================== LCD（Waveshare ESP32-C6-LCD-1.47, ST7789/172x320） ====================
 class LGFX_ESP32C6_WS : public lgfx::LGFX_Device {
@@ -77,11 +79,8 @@ int textSize   = 1;
 int responseLineCount = 0;  // レスポンス行数をカウント
 
 // タイムアウト管理用変数
-unsigned long commandSentTime = 0;
 unsigned long gpio20LowTime = 0;
-bool waitingForResponse = false;
 bool gpio20IsLow = false;
-const unsigned long RESPONSE_TIMEOUT_MS = 20000;  // 10秒
 const unsigned long GPIO20_LOW_DURATION_MS = 1000; // 1秒
 
 // 画面クリア＆ホーム（タイトル再描画オプション付き）
@@ -92,7 +91,7 @@ void lcdClearBeforeNewLine(bool drawHeader = true) {
 
   if (drawHeader) {
     lcd.setCursor(margin, margin);
-    //lcd.println("PC->LCD(clear) / UART1 TX(LF) / UART1 RX->PC");
+    lcd.println("AT Command Executor");
     cursorY = margin + lineHeight;
     cursorX = margin;
     lcd.drawLine(margin, cursorY, lcd.width() - margin, cursorY, TFT_DARKGREY);
@@ -114,23 +113,118 @@ void lcdPrintLine(const String& line) {
   lcdNewLine();
 }
 
-//==================== PCから行単位で受信 ====================
-/*
- * Serial(USB CDC, 115200)から LF 終端の1行を取得。
- * - CRは無視（CRLF対応）
- * - 受信がない場合は空行("")を返す
- */
-String pcReadLine() {
-  if (!Serial.available()) return String("");
+//==================== ファイル読み込み & ATコマンド実行 ====================
+static int currentLineIndex = 0;
+static std::vector<String> commandLines;
+bool commandsLoaded = false;
+bool waitingForCommandResponse = false;
+unsigned long commandSentTime = 0;
+const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 10000;  // 10秒
 
-  String line;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;     // CRは破棄
-    if (c == '\n') break;        // LFで行確定
-    line += c;
+// SOCKET文字列比較用変数
+String sendDataString = "";
+String receiveDataString = "";
+bool hasSendData = false;
+bool hasReceiveData = false;
+
+// RSRP情報保存用変数
+String rsrpInfo = "";
+bool hasRsrpInfo = false;
+
+// コマンドファイルを読み込み
+void loadCommandFile() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[ERROR] Failed to mount LittleFS");
+    return;
   }
-  return line;
+
+  File file = LittleFS.open("/commands1.txt", "r");
+  if (!file) {
+    Serial.println("[ERROR] Failed to open commands1.txt");
+    return;
+  }
+
+  commandLines.clear();
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();  // 改行コードや空白を除去
+    if (line.length() > 0) {
+      commandLines.push_back(line);
+    }
+  }
+  file.close();
+  
+  Serial.printf("[INFO] Loaded %d lines from commands1.txt\n", commandLines.size());
+  commandsLoaded = true;
+  currentLineIndex = 0;
+}
+
+// 次のATコマンドを送信
+void sendNextCommand() {
+  if (!commandsLoaded || currentLineIndex >= commandLines.size()) {
+    Serial.println("[INFO] All commands completed");
+    lcdClearBeforeNewLine();
+    lcdPrintLine("All commands completed!");
+    
+    // 文字列比較結果表示
+    if (hasSendData && hasReceiveData) {
+      if (sendDataString.equals(receiveDataString)) {
+        lcdPrintLine("String MATCH!");
+        Serial.println("[INFO] SEND/RECEIVE strings MATCH! (26 chars)");
+      } else {
+        lcdPrintLine("String MISMATCH");
+        Serial.printf("[INFO] SEND/RECEIVE strings MISMATCH (26 chars) - SEND: %s, RECEIVE: %s\n", sendDataString.c_str(), receiveDataString.c_str());
+      }
+    } else {
+      lcdPrintLine("No data to compare");
+    }
+    
+    // RSRP情報表示
+    if (hasRsrpInfo) {
+      lcdPrintLine(rsrpInfo);
+    }
+    return;
+  }
+
+  String command = commandLines[currentLineIndex];
+  
+  // "#"で始まる行はスキップ
+  if (command.startsWith("#")) {
+    Serial.printf("[SKIP] Comment line: %s\n", command.c_str());
+    currentLineIndex++;
+    sendNextCommand();  // 再帰的に次のコマンドをチェック
+    return;
+  }
+
+  // SOCKETDATA SENDコマンドの文字列を抽出
+  if (command.indexOf("AT%SOCKETDATA=\"SEND\",1,13,") >= 0) {
+    int startPos = command.indexOf(",13,") + 4;
+    if (startPos > 3 && startPos < command.length()) {
+      sendDataString = command.substring(startPos);
+      sendDataString.replace("\"", ""); // クォーテーションを削除
+      // 先頭26文字に制限
+      if (sendDataString.length() > 26) {
+        sendDataString = sendDataString.substring(0, 26);
+      }
+      hasSendData = true;
+      Serial.printf("[INFO] SEND data captured (26 chars): %s\n", sendDataString.c_str());
+    }
+  }
+
+  // LCDクリア & コマンド表示
+  lcdClearBeforeNewLine();
+  lcdPrintLine("CMD: " + command);
+
+  // UART1へ送信
+  Serial.printf("[TX->UART1] %s\n", command.c_str());
+  Serial1.print(command);
+  Serial1.print("\r\n");
+
+  // レスポンス待ち状態へ
+  waitingForCommandResponse = true;
+  commandSentTime = millis();
+  responseLineCount = 0;
+  currentLineIndex++;
 }
 
 //==================== UART設定 ====================
@@ -209,9 +303,12 @@ void setup() {
   digitalWrite(20, HIGH);
   Serial.println("[GPIO20] Set to HIGH");
 
-  // UART1 (9600, 8N1, TX=18, RX=19)
+  // UART1 (115200, 8N1, TX=18, RX=19)
   Serial1.begin(BAUD_UART, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
   Serial1.setRxBufferSize(2048);
+
+  // LCD初期化前の待機時間（6秒）
+  delay(6000);
 
   // LCD初期化
   lcd.begin();
@@ -225,9 +322,17 @@ void setup() {
   lineHeight = lcd.fontHeight() * textSize;
 
   // 初期画面
-  lcdClearBeforeNewLine(); // 起動時もヘッダ付きでクリア
+  lcdClearBeforeNewLine(); 
+  lcdPrintLine("Loading commands...");
 
-  Serial.println("[READY] Type a line (UTF-8). Press Enter (LF).");
+  // コマンドファイル読み込み
+  loadCommandFile();
+  
+  Serial.println("[READY] AT Command execution started.");
+  
+  // 最初のコマンド送信
+  delay(1000);  // 1秒待機してから開始
+  sendNextCommand();
 }
 
 void loop() {
@@ -239,54 +344,77 @@ void loop() {
     Serial.println("[GPIO20] Set to HIGH (timeout recovery)");
   }
   
-  // レスポンスタイムアウト監視
-  if (waitingForResponse && (millis() - commandSentTime >= RESPONSE_TIMEOUT_MS)) {
+  // コマンドレスポンスタイムアウト監視
+  if (waitingForCommandResponse && (millis() - commandSentTime >= COMMAND_RESPONSE_TIMEOUT_MS)) {
     // 10秒以上レスポンスがない場合
-    Serial.println("[TIMEOUT] No response for 10 seconds - Resetting GPIO20");
-    digitalWrite(20, LOW);
-    gpio20LowTime = millis();
-    gpio20IsLow = true;
-    waitingForResponse = false;
-    Serial.println("[GPIO20] Set to LOW (timeout)");
-  }
-
-  // 1) PCから1行受信（LF終端）
-  String line = pcReadLine();
-
-  if (line.length() > 0) {
-    // 2) 表示前にクリア関数を実行（先頭から描画）
-    lcdClearBeforeNewLine(/*drawHeader=*/true);
-    responseLineCount = 0;  // レスポンス行数をリセット
-
-    // 3) LCDへ行表示
-    lcdPrintLine(line);
-
-    // 4) UART1へ UTF-8 + LF で送信
-    Serial.print("[TX->UART1] "); Serial.println(line);
-    Serial1.write((const uint8_t*)line.c_str(), line.length());
-    Serial1.write('\r'); // LF終端
+    Serial.println("[TIMEOUT] No response for 10 seconds - Moving to next command");
+    waitingForCommandResponse = false;
     
-    // タイムアウト監視開始
-    commandSentTime = millis();
-    waitingForResponse = true;
+    // 次のコマンドを送信
+    delay(1000);
+    sendNextCommand();
   }
 
-  // 5) UART1_RX のレスポンス行をPCとLCDに表示（UTF-8としてそのまま）
+  // UART1_RX のレスポンス行をPCとLCDに表示
   String resp;
   if (uart1GetLine(resp)) {
     Serial.print("[RX<-UART1] ");
     Serial.println(resp);
     responseLineCount++;
     
-    // レスポンスを受信したのでタイムアウト監視を停止
-    if (responseLineCount >= 2) {
-      waitingForResponse = false;
+    // SOCKETDATA RECEIVEレスポンスの文字列を抽出
+    if (resp.indexOf("%SOCKETDATA:1,13,0,") >= 0) {
+      int startPos = resp.indexOf(",0,") + 3;
+      if (startPos > 2 && startPos < resp.length()) {
+        String tempReceive = resp.substring(startPos);
+        // ""で囲まれた部分を抽出
+        int firstQuote = tempReceive.indexOf('"');
+        int lastQuote = tempReceive.lastIndexOf('"');
+        if (firstQuote >= 0 && lastQuote > firstQuote) {
+          receiveDataString = tempReceive.substring(firstQuote + 1, lastQuote);
+          // 先頭26文字に制限
+          if (receiveDataString.length() > 26) {
+            receiveDataString = receiveDataString.substring(0, 26);
+          }
+          hasReceiveData = true;
+          Serial.printf("[INFO] RECEIVE data captured (26 chars): %s\n", receiveDataString.c_str());
+        }
+      }
     }
     
-    if (responseLineCount == 2) {
-      // 2回目のレスポンスのみLCDに表示
-      lcdPrintLine(">" + resp);
+    // RSRP情報を検出
+    if (resp.indexOf("RSRP: Reported") >= 0) {
+      int rsrpStart = resp.indexOf("RSRP: Reported");
+      int commaPos = resp.indexOf(',', rsrpStart);
+      if (commaPos > rsrpStart) {
+        rsrpInfo = resp.substring(rsrpStart, commaPos);
+      } else {
+        rsrpInfo = resp.substring(rsrpStart);
+      }
+      // "Reported "を削除してRSRPの数値のみにする
+      rsrpInfo.replace("Reported ", "");
+      // 手動で"dBm"を追加
+      rsrpInfo += " dBm";
+      hasRsrpInfo = true;
+      Serial.printf("[INFO] RSRP info captured: %s\n", rsrpInfo.c_str());
     }
-    // 1回目のレスポンスはLCDに表示しない
+    
+    // LCDにレスポンス表示
+    if (resp.length() > 0) {
+      String displayResp = resp;
+      if (displayResp.length() > 20) {  // 長すぎる場合は短縮
+        displayResp = displayResp.substring(0, 17) + "...";
+      }
+      lcdPrintLine("RSP: " + displayResp);
+    }
+    
+    // "OK"または"ERROR"が来たらコマンド完了と判断
+    if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
+      waitingForCommandResponse = false;
+      
+      // 2秒待機してから次のコマンドを送信
+      delay(2000);
+      sendNextCommand();
+    }
   }
 }
