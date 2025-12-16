@@ -135,7 +135,7 @@ String pcReadLine() {
 
 //==================== UART設定 ====================
 static const uint32_t BAUD_PC   = 115200;
-static const uint32_t BAUD_UART = 9600;
+static const uint32_t BAUD_UART = 115200;
 static const int UART1_TX_PIN   = 18;  // GP18 = UART1 TX
 static const int UART1_RX_PIN   = 19;  // GP19 = UART1 RX
 
