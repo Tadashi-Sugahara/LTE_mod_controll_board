@@ -210,7 +210,7 @@ void setup() {
   Serial.println("[GPIO20] Set to HIGH");
 
   // UART1 (9600, 8N1, TX=18, RX=19)
-  Serial1.begin(BAUD_UART, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
+  Serial1.begin(BAUD_UART, SERIAL_8E1, UART1_RX_PIN, UART1_TX_PIN);
   Serial1.setRxBufferSize(2048);
 
   // LCD初期化
