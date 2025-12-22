@@ -1,0 +1,103 @@
+=== AT Log start ===
+file: /logs/atlog_59s.txt
+[59s] RUN START
+[59s] CMD: AT+CREG=0
+[59s] RSP: ίoοΏsÿwώΌύ{ώε'ύό―ΏηOύύώÿί[ηώ{oηUϋί[·ÿηουώοÿΧΎίχυÿϊÿχεΎ¶ÿϋϋΞÿώ³ΧϊÿώΫÿύχ\ϊϋ[ÿ;ÿÿϋήv?ωυΏΏÿÿοÿÿχκχÿίγόoΟÿίÿϋ·ÿϊχΏÿΧγΉοÿ{ÿχÿοÿύ_ÿÿ¦wzοοÿΧÿ_/Οιÿ3φ/ÿώξξΗΏ~ΫΠÿω»›]ΣÿώΏ½Ώοόίί¶ωύϋύlΫ??χ»wέέÿ®ÿΎÿΥλ³:όΏχίή»qνλy_Ο/ÿϊχνώÿwÿÿσ®ξxϋξÿ_ÿ΄Φοϋοσύoÿ™W·φ3όούϊÿΥυοώΎΏ_ξÿϋχφ}ίÿϋΗω―ϋÿύ»Ύ·}ίοέ[µΫÿ\wτύή{ϊφAT+CREG=0
+[59s] CMD: AT+CEREG=2
+[59s] RSP: OK
+[59s] RSP: ΫήO_Ώÿύί»ϊAT+CEREG=2
+[60s] CMD: AT%TRSHCMD="BSPFILE","TECHSEL","1"
+[60s] RSP: OK
+[60s] RSP: AT%TRSHCMD="BSPFILE","TECHSEL","1"
+[60s] CMD: AT%SETCFG="BAND","8"
+[60s] RSP: OK
+[60s] RSP: AT%SETCFG="BAND","8"
+[61s] CMD: AT%TRSHCMD="BSPFILE","TECHSEL","0"
+[61s] RSP: OK
+[61s] RSP: AT%TRSHCMD="BSPFILE","TECHSEL","0"
+[61s] CMD: AT+CGATT=0
+[61s] RSP: OK
+[61s] RSP: AT+CGATT=0
+[61s] RSP: χ•ÿl»μ_ÿ
+[62s] CMD: AT+COPS=2
+[62s] RSP: OK
+[62s] RSP: +CEREG: 0
+[62s] RSP: Oύ½ÿÿΏύϋύÿΏ―χÿAT+COPS=2
+[62s] CMD: AT%NWOPER="SOFTBANK"
+[62s] RSP: OK
+[62s] RSP: AT%NWOPER="SOFTBANK"
+[63s] CMD: AT+CGDCONT=1,"IP","sakura"
+[63s] RSP: OK
+[63s] RSP: AT+CGDCONT=1,"IP","sakura"
+[63s] CMD: AT+CGAUTH=1,0
+[63s] RSP: OK
+[63s] RSP: AT+CGAUTH=1,0
+[64s] CMD: AT+CFUN=1
+[64s] RSP: OK
+[64s] RSP: AT+CFUN=1
+[64s] CMD: AT+COPS=1,2,"44020"
+[64s] RSP: OK
+[64s] RSP: AT+COPS=1,2,"44020"
+[65s] EVENT: pause requested by SW
+[65s] EVENT: paused by switch
+[65s] RSP: ώkμuήωώÿΛÿ·οÿν[ΏίωÿίίÿÿΏυϋÿώόϋφΏΏÿOίοÿ{ÿΟφΫώÿώ~οηίΏώoύήώ_ÿwύώύΦίχίϋ~ϋΏο{οoίχÿϋϊΫ»ÿvώÿÿΟÿύύίίίÿιίÿϋÿÿώϋoοΏλϋϊϋοÿϋίοÿÿ―ÿuÿ·ώχοoΫ]ώoÿοφΫÿοÿχÿ―ϋoÿίχίÿώώήΛοÿίÿϋώϋmÿϋχÿχ{ÿϋξϋÿΊ~φÿΛÿώΚχΎύύÿφχÿÿϋϋώÿίÿΏΞÿνίλÿξÿϋÿÿÿÿΫϋίλίÿί’ÿύ¶ϋή\•ηάYϋ
+[65s] RSP: Ώÿÿχÿÿϋÿιυsÿ~Νÿ
+[65s] RSP: ÿÿίÿ
+[66s] EVENT: resume requested by SW
+[66s] EVENT: resumed by switch
+[66s] CMD: AT+COPS?
+[66s] RSP: ΏΎÿ=ΗΏοÿώ
+[66s] RSP: οώ
+[66s] CMD: AT%PDNSET=1,"sakura","IP", "NONE","","",
+[67s] RSP: OK
+[67s] RSP: +CEREG: 2
+[67s] RSP: +CEREG: 5,"409F","03917A0D",7
+[67s] RSP: AT+COPS?
+[67s] RSP: +COPS: 1,2,"44020",7
+[67s] CMD: AT%PINGCMD=0,"192.168.5.100",3
+[67s] RSP: OK
+[67s] RSP: AT%PDNSET=1,"sakura","IP", "NONE","","",ÿÿ
+[68s] CMD: AT%PINGCMD=0,"8.8.8.8",3
+[68s] RSP: OK
+[68s] RSP: ÿAT%PINGCMD=0,"192.168.5.100",3ÿ
+[68s] RSP: ÿ
+[69s] RSP: %PINGCMD:1,"192.168.5.100",182,64
+[69s] RSP: %PINGCMD:2,"192.168.5.100",706,64
+[69s] RSP: %PINGCMD:3,"192.168.5.100",457,64
+[69s] CMD: AT%SOCKETEV=0,1
+[69s] RSP: OK
+[69s] RSP: AT%PINGCMD=0,"8.8.8.8",3
+[70s] RSP: %PINGCMD:1,"8.8.8.8",469,115
+[70s] RSP: %PINGCMD:2,"8.8.8.8",475,115
+[70s] RSP: %PINGCMD:3,"8.8.8.8",476,115
+[71s] CMD: AT%SOCKETCMD="ALLOCATE",1,"UDP","OPEN","192.168.5.100",9002,5201,0,60,1
+[71s] RSP: OK
+[71s] RSP: AT%SOCKETEV=0,1
+[71s] CMD: AT%SOCKETCMD="ACTIVATE",1
+[71s] RSP: OK
+[71s] RSP: AT%SOCKETCMD="ALLOCATE",1,"UDP","OPEN","192.168.5.100",9002,5201,0,60,1
+[71s] RSP: %SOCKETCMD:2
+[72s] CMD: AT%SOCKETCMD="INFO",1
+[72s] RSP: OK
+[72s] RSP: AT%SOCKETCMD="ACTIVATE",1
+[72s] CMD: AT%SOCKETDATA="SEND",1,13,"48454C4C4F20574F524C440D0A"
+[72s] RSP: OK
+[72s] RSP: AT%SOCKETCMD="INFO",1
+[72s] RSP: %SOCKETCMD:"ACTIVATED","UDP","10.0.0.94","192.168.5.100",5201,9002
+[73s] CMD: AT%SOCKETDATA="RECEIVE",1,100
+[73s] RSP: OK
+[73s] RSP: AT%SOCKETDATA="SEND",1,13,"48454C4C4F20574F524C440D0A"
+[73s] RSP: %SOCKETDATA:1,13
+[73s] CMD: AT%MEAS="0"
+[73s] RSP: OK
+[73s] RSP: %SOCKETEV:1,1
+[73s] RSP: AT%SOCKETDATA="RECEIVE",1,100
+[73s] RSP: %SOCKETDATA:1,13,0,"48454C4C4F20574F524C440D0A","192.168.5.100",47318
+[74s] CMD: AT+CCLK?
+[74s] RSP: OK
+[74s] RSP: AT%MEAS="0"
+[74s] RSRP: RSRP: = -94 dBm
+[74s] RSP: %MEAS: RSRP: Reported = -94, Rx0Tx0 = -97, Rx0Tx1 = -95, Rx0Tx2 = -140, Rx0Tx3 = -140, Rx1Tx0 = -140, Rx1Tx1 = -140, Rx1Tx2 = -140, Rx1Tx3 = -140
+[74s] RESULT: MATCH
+[74s] RUN END
+=== AT Log end ===
