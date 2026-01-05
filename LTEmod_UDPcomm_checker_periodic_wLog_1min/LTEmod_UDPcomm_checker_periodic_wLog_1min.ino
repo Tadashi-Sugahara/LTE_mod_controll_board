@@ -53,11 +53,12 @@ bool isRunning=false;
 bool idleHoldDisplay=false;
 unsigned long lastRunMillis=0;
 const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 30000; // 30s
-const unsigned long RUN_INTERVAL_MS = 300000UL; // 5min
+const unsigned long RUN_INTERVAL_MS = 60000UL; // 1min
 uint32_t ngCountRun=0, passCountRun=0;
 unsigned long gpio20LowTime=0; bool gpio20IsLow=false; const unsigned long GPIO20_LOW_DURATION_MS=1000;
 bool pendingRestartAfterError=false;
 String rsrpInfo=""; bool hasRsrpInfo=false; String lastRsrpInfo=""; bool hasLastRsrp=false;
+
 /* ==================== ログ（LittleFS） ==================== */
 String logFilePath=""; fs::File logFile; bool logReady=false;
 bool hasClockFromModem=false; String currentClockStr="";
@@ -138,7 +139,7 @@ void showIdleNextRunScreen(){
   if(hasRsrpInfo && rsrpInfo.length()>0){ rsrpLine=rsrpInfo; lastRsrpInfo=rsrpInfo; hasLastRsrp=true; }
   else if(hasLastRsrp && lastRsrpInfo.length()>0){ rsrpLine=lastRsrpInfo; }
   else { rsrpLine="RSRP: N/A"; }
-  lcdPrintLine(rsrpLine); lcdPrintLine("Next run in 5 minutes...");
+  lcdPrintLine(rsrpLine); lcdPrintLine("Next run in 1 minutes...");
   idleHoldDisplay=true;
 }
 void startRun(){
@@ -305,7 +306,7 @@ void setup(){
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setTextDatum(textdatum_t::top_left);
   lineHeight=lcd.fontHeight()*textSize;
-  lcdClearBeforeNewLine(); lcdPrintLine("READY - Log + Transfer (5min, UART1 off in idle)");
+  lcdClearBeforeNewLine(); lcdPrintLine("READY - Log + Transfer (1min, UART1 off in idle)");
   rgb.begin(); rgb.show(); showIdle();
   lastRunMillis=millis();
   startRun(); // 起動直後に自動開始（ここで UART1.enable）
