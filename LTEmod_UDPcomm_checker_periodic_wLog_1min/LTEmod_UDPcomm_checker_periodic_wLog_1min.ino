@@ -1,39 +1,37 @@
 
 /*
- * ESP32-C6: LittleFS の /command1.txt から AT コマンドを順次実行（UART1）
+ * ESP32-C6: LittleFS の /commands1.txt から AT コマンドを順次実行（UART1）
  * - LCD（LovyanGFX/ST7789）へ CMD/RSP 表示、WS2812で結果表示
  * - ログ: /logs/atlog_YYYYMMDD_HHMMSS.txt（+CCLK時刻／なければ millis）
  * - PC→ESP32: #LIST / #GET <path> / #DELLOG（FILEBEGIN size + 本体 + FILEEND）
- * - タイムアウト 30 秒（COMMAND_RESPONSE_TIMEOUT_MS = 30000）
- * - AT+COPS / AT%SOCKETDATA / AT%SOCKETCMD / AT%PINGCMD 送信直後のみ「次コマンド送出Earliest時刻」= 10秒後（レスポンス待ちは延長しない）
+ * - 既定タイムアウト 30 秒（COMMAND_RESPONSE_TIMEOUT_MS）
+ * - AT+COPS=1,2,"44020" 特例:
+ *   - 各試行で最大10秒待機（タイムアウトでリトライ）
+ *   - 16進数トークン（<XX>）受信を検知（ログ）
+ * - すべてのコマンドで ERROR 受信時は最大10回までリトライ（共通）
  * - 起動直後に1回開始、その後は 1 分おき（60,000ms）に自動実行
  * - ★ インターバル中は UART1 を停止（Serial1.end）→受信完全停止
  * - ★ 非ASCII（バイナリ）をHEX化して表示・ログ（makePrintable）
- * - ★ 10秒待ち中はASCII比率低い行を捨てる（asciiRatio<0.6）
  * - 転送中は PC向けログ出力を抑止（pcTransferActive）
- *
- * 監視対象（成功/失敗カウントやERROR時の副作用：LED/リセット）は以下の2コマンドのみ：
- *   1) AT+COPS=1,2,"44020"（完全一致）
- *   2) AT%SOCKETDATA="RECEIVE",...（前方一致）
  */
 
 #include <Arduino.h>
-#include <FS.h>           // fs::File
-#include <LittleFS.h>     // LittleFS
+#include <FS.h>         // fs::File
+#include <LittleFS.h>   // LittleFS
 #include <LovyanGFX.hpp>
 #include <Adafruit_NeoPixel.h>
 #include <vector>
 
 /* ==================== グローバル設定・ユーティリティ ==================== */
 bool pcTransferActive = false;
-#define PC_PRINT(s)     do{ if(!pcTransferActive) Serial.print(s); } while(0)
-#define PC_PRINTLN(s)   do{ if(!pcTransferActive) Serial.println(s); } while(0)
-#define PC_PRINTF(...)  do{ if(!pcTransferActive) Serial.printf(__VA_ARGS__); } while(0)
+#define PC_PRINT(s)    do{ if(!pcTransferActive) Serial.print(s); } while(0)
+#define PC_PRINTLN(s)  do{ if(!pcTransferActive) Serial.println(s); } while(0)
+#define PC_PRINTF(...) do{ if(!pcTransferActive) Serial.printf(__VA_ARGS__); } while(0)
 
 #define RGB_PIN   8
 #define RGB_COUNT 1
-// NeoPixelの色順はGRBが一般的（環境によりNEO_RGBが未定義）
-Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_RGB + NEO_KHZ800);
+
 inline void rgbSet(uint8_t r, uint8_t g, uint8_t b){ rgb.setPixelColor(0, rgb.Color(r,g,b)); rgb.show(); }
 inline void showMatch()    { rgbSet(0, 0, 255); }
 inline void showMismatch() { rgbSet(255, 0, 0); }
@@ -54,15 +52,17 @@ public:
   }
 };
 LGFX_ESP32C6_WS lcd;
+
 static const int margin=8;
 int cursorX=margin, cursorY=margin;
 int lineHeight=0, textSize=1;
 int responseLineCount=0;
 bool isRunning=false;
 bool idleHoldDisplay=false;
+
 unsigned long lastRunMillis=0;
-const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 30000; // 30s
-const unsigned long RUN_INTERVAL_MS = 60000UL;           // 1min
+const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 30000;   // 既定 30s
+const unsigned long RUN_INTERVAL_MS              = 60000UL; // 1min
 uint32_t ngCountRun=0, passCountRun=0;
 
 unsigned long gpio20LowTime=0; bool gpio20IsLow=false; const unsigned long GPIO20_LOW_DURATION_MS=1000;
@@ -73,8 +73,10 @@ String rsrpInfo=""; bool hasRsrpInfo=false; String lastRsrpInfo=""; bool hasLast
 /* ==================== ログ（LittleFS） ==================== */
 String logFilePath=""; fs::File logFile; bool logReady=false;
 bool hasClockFromModem=false; String currentClockStr="";
+
 bool ensureFS(){ if(!LittleFS.begin(true)){ PC_PRINTLN("[ERROR] Failed to mount LittleFS"); return false; } return true; }
 static String pad2(int v){ String s=String(v); if(s.length()<2) s="0"+s; return s; }
+
 String cclkToFilenameStamp(const String &cclk){
   int q1=cclk.indexOf('"'), q2=cclk.lastIndexOf('"');
   String core=(q1>=0&&q2>q1)? cclk.substring(q1+1,q2):cclk;
@@ -85,7 +87,8 @@ String cclkToFilenameStamp(const String &cclk){
   return String("20")+yy+pad2(MM.toInt())+pad2(dd.toInt())+"_"+pad2(hh.toInt())+pad2(mm.toInt())+pad2(ss.toInt());
 }
 String makeLogFilePath(){ String stamp=(hasClockFromModem && currentClockStr.length()>0)? cclkToFilenameStamp(currentClockStr) : String(millis()/1000)+"s"; return String("/logs/atlog_")+stamp+String(".txt"); }
-void openNewLog(){ if(!ensureFS()){ logReady=false; return; } LittleFS.mkdir("/logs"); logFilePath=makeLogFilePath();
+void openNewLog(){
+  if(!ensureFS()){ logReady=false; return; } LittleFS.mkdir("/logs"); logFilePath=makeLogFilePath();
   logFile=LittleFS.open(logFilePath,"a");
   if(!logFile){ PC_PRINTF("[ERROR] Failed to open log file: %s\n", logFilePath.c_str()); logReady=false; return; }
   logReady=true; PC_PRINTF("[LOG] Opened: %s\n", logFilePath.c_str()); logFile.printf("=== AT Log start ===\nfile: %s\n", logFilePath.c_str()); logFile.flush();
@@ -125,51 +128,68 @@ float asciiRatio(const String& s){
   return (float)ascii/(float)s.length();
 }
 
-/* ==================== ATコマンド実行 ==================== */
+// 16進数トークン（<XX>）が含まれる行か判定（ラムダ非使用版）
+inline bool isHexChar(char c){
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+}
+inline bool containsHexToken(const String& printable){
+  int pos = printable.indexOf('<');
+  while (pos >= 0) {
+    if (pos + 3 < printable.length()) {
+      char c1 = printable[pos + 1];
+      char c2 = printable[pos + 2];
+      char c3 = printable[pos + 3];
+      if (isHexChar(c1) && isHexChar(c2) && c3 == '>') {
+        return true;
+      }
+    }
+    pos = printable.indexOf('<', pos + 1);
+  }
+  return false;
+}
+
+/* ==================== ATコマンド実行（COPS特別処理＋共通ERRORリトライ） ==================== */
 static int currentLineIndex=0;
 static std::vector<String> commandLines;
 bool commandsLoaded=false, waitingForCommandResponse=false;
 unsigned long commandSentTime=0;
-// ★ 送信直後に次コマンド送出を遅らせる Earliest（AT+COPS/AT%SOCKETDATA/AT%SOCKETCMD/AT%PINGCMD）
-unsigned long nextSendEarliestMs=0; // 0=制約なし / >0=Earliestまで次コマンド不可
+
+// 直近コマンド情報（再送用）
+String currentCommandStr="";
+unsigned long currentCommandTimeoutMs=COMMAND_RESPONSE_TIMEOUT_MS;
+
+// COPS 特別モード（タイムアウト用）
+bool isCopsCommandActive=false;
+int  copsAttempts=0;
+bool copsSawHex=false;
+// ★ COPSのタイムアウト再送の上限（初回＋再送）。10で「初回＋9回再送＝最大10回」
+const int COPS_MAX_ATTEMPTS = 10;
+
+// ★ すべてのコマンドに共通の「ERROR時リトライ」制御
+int  errorRetryAttempts = 0;
+const int MAX_ERROR_RETRY = 10;
+
 String sendDataString="", receiveDataString="";
 bool hasSendData=false, hasReceiveData=false;
+
 // ★ UART1 をサイクル時のみ利用
 static const uint32_t BAUD_PC=115200, BAUD_UART=115200;
 static const int UART1_TX_PIN=18, UART1_RX_PIN=19;
 void uart1Enable(){ Serial1.begin(BAUD_UART, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN); Serial1.setRxBufferSize(4096); PC_PRINTLN("[UART1] Enabled"); }
 void uart1Disable(){ Serial1.end(); PC_PRINTLN("[UART1] Disabled"); }
 
-/*** 監視対象コマンド関連（追加） ***/
-// 監視対象かどうかを判定
-bool isMonitoredCommandString(const String& cmd){
-  if (cmd == String(F("AT+COPS=1,2,\"44020\""))) return true;              // 完全一致
-  if (cmd.startsWith(F("AT%SOCKETDATA=\"RECEIVE\","))) return true;        // 前方一致
-  return false;
-}
-bool currentIsMonitored = false;
-uint32_t monitoredTotal   = 0;
-uint32_t monitoredSuccess = 0;
-uint32_t monitoredFail    = 0;   // 実行時のOK/ERRORの成否集計（監視対象のみ）
-
 void loadCommandFile(){
   if(!ensureFS()) return;
-  // LittleFS のコマンドファイル（ユーザー要望に合わせ /command1.txt）
-  fs::File file=LittleFS.open("/command1.txt","r");
-  if(!file){
-    PC_PRINTLN("[ERROR] Failed to open command1.txt");
-    return;
-  }
+  fs::File file=LittleFS.open("/commands1.txt","r"); if(!file){ PC_PRINTLN("[ERROR] Failed to open commands1.txt"); return; }
   commandLines.clear();
   while(file.available()){ String line=file.readStringUntil('\n'); line.trim(); if(line.length()>0) commandLines.push_back(line); }
   file.close();
-  PC_PRINTF("[INFO] Loaded %d lines from command1.txt\n",(int)commandLines.size());
+  PC_PRINTF("[INFO] Loaded %d lines from commands1.txt\n",(int)commandLines.size());
   commandsLoaded=true; currentLineIndex=0;
 }
 
 void showIdleNextRunScreen(){
-  lcdClearBeforeNewLine();
-  String rsrpLine;
+  lcdClearBeforeNewLine(); String rsrpLine;
   if(hasRsrpInfo && rsrpInfo.length()>0){ rsrpLine=rsrpInfo; lastRsrpInfo=rsrpInfo; hasLastRsrp=true; }
   else if(hasLastRsrp && lastRsrpInfo.length()>0){ rsrpLine=lastRsrpInfo; }
   else { rsrpLine="RSRP: N/A"; }
@@ -196,12 +216,6 @@ void finishRun(){
   isRunning=false; lastRunMillis=millis();
   showIdleNextRunScreen();
   PC_PRINTLN("[INFO] Waiting for next 1-minute run");
-  // 監視対象コマンドの集計を表示
-  PC_PRINTLN("==== 監視対象コマンドの集計 ====");
-  PC_PRINTF("対象総数: %lu\n", (unsigned long)monitoredTotal);
-  PC_PRINTF("成功件数: %lu\n", (unsigned long)monitoredSuccess);
-  PC_PRINTF("失敗件数: %lu\n", (unsigned long)monitoredFail);
-  PC_PRINTLN("================================");
   logWrite("RUN END"); closeLog();
 }
 
@@ -230,45 +244,57 @@ void sendNextCommand(){
   if(command.startsWith("#")){ PC_PRINTF("[SKIP] Comment line: %s\n", command.c_str()); currentLineIndex++; sendNextCommand(); return; }
 
   // 送受比較対象抽出（例: AT%SOCKETDATA="SEND",1,13,"...）
-  if(command.indexOf("AT%SOCKETDATA=\"SEND\",1,13,\"")>=0){
-    int startPos=command.indexOf(",13,\"")+5;
-    if(startPos>4 && startPos<command.length()){
+  if(command.indexOf("AT%SOCKETDATA=\"SEND\",1,13,")>=0){
+    int startPos=command.indexOf(",13,")+5; // ",13," の直後から
+    if(startPos>3 && startPos<(int)command.length()){
       sendDataString=command.substring(startPos); sendDataString.replace("\"","");
       if(sendDataString.length()>26) sendDataString=sendDataString.substring(0,26);
       hasSendData=true; PC_PRINTF("[INFO] SEND data captured (26 chars): %s\n", sendDataString.c_str());
     }
   }
 
-  // 監視対象判定をセット
-  currentIsMonitored = isMonitoredCommandString(command);
-  if (currentIsMonitored) { monitoredTotal++; }
-
   // 送信表示＆UART1送信
   lcdClearBeforeNewLine(); lcdPrintLine("CMD: "+command);
   PC_PRINTF("[TX->UART1] %s\n", command.c_str());
   Serial1.print(command); Serial1.print("\r\n");
+
+  // 直近送信コマンドを記録（再送用）
+  currentCommandStr = command;
+
   waitingForCommandResponse=true;
   commandSentTime=millis();
   responseLineCount=0;
 
-  // AT+COPS / AT%SOCKETDATA / AT%SOCKETCMD / AT%PINGCMD は次コマンド送出Earliest=10s後
-  if(command.startsWith("AT+COPS") || command.startsWith("AT%SOCKETDATA") || command.startsWith("AT%SOCKETCMD") || command.startsWith("AT%PINGCMD")){
-    nextSendEarliestMs=millis()+10000UL; PC_PRINTLN("[WAIT] Next command blocked until 10s after send");
-  }else nextSendEarliestMs=0;
+  // ★ ERROR再送回数の初期化（全コマンド共通）
+  errorRetryAttempts = 0;
 
-  currentLineIndex++; logWrite(String("CMD: ")+command);
+  // COPS特別処理のセットアップ（タイムアウトは10秒・インデックスは成功/最終失敗時に進める）
+  if(command.equals("AT+COPS=1,2,\"44020\"")){
+    isCopsCommandActive = true;
+    copsAttempts = 1;                       // 初回送信を1回目として数える（タイムアウト用）
+    copsSawHex   = false;                   // ヘックス受信フラグ
+    currentCommandTimeoutMs = 10000UL;      // COPSは各試行で10秒待ち
+    logWrite("COPS: special handling started (timeout=10s, max attempts=10)");
+  }else{
+    isCopsCommandActive = false;
+    copsAttempts = 0;
+    copsSawHex   = false;
+    currentCommandTimeoutMs = COMMAND_RESPONSE_TIMEOUT_MS; // 既定30秒
+  }
+
+  // 重要：ここでは currentLineIndex を進めない
+  // → 成功（OK）／最終失敗（ERROR上限 or COPSタイムアウト上限）／通常コマンドのタイムアウト時に進める
+  logWrite(String("CMD: ")+command);
 }
 
-// Earliest到達で次へ（非ブロッキング）
-void advanceWhenReady(){
-  if(nextSendEarliestMs>0 && millis()<nextSendEarliestMs) return;
-  nextSendEarliestMs=0; delay(200); sendNextCommand();
-}
+// 前進処理（短いウェイトのみ）
+void advanceWhenReady(){ delay(200); sendNextCommand(); }
 
 /* ==================== UART1受信（行確定） ==================== */
 static std::vector<uint8_t> uart1Buf;
 static uint32_t uart1LastByteMs=0;
-static const uint32_t UART1_GAP_MS=15; // 受信安定化
+static const uint32_t UART1_GAP_MS=15; // 受信安定化：50→15ms
+
 bool uart1GetLine(String &out){
   bool got=false;
   // インターバル中は受信停止
@@ -371,12 +397,6 @@ void loop(){
   handlePcSerialCommands();
   if(pcTransferActive) return;
 
-  // ★ Earliest定期判定（応答済み & Earliest設定ありなら、10秒到達で次へ）
-  if(isRunning && !waitingForCommandResponse && nextSendEarliestMs>0 && millis()>=nextSendEarliestMs){
-    PC_PRINTLN("[WAIT] 10s elapsed since send -> advance");
-    advanceWhenReady();
-  }
-
   // GPIO20 自動復帰
   if(gpio20IsLow && (millis()-gpio20LowTime >= GPIO20_LOW_DURATION_MS)){
     digitalWrite(20, HIGH); gpio20IsLow=false; PC_PRINTLN("[GPIO20] Set to HIGH (timeout recovery)");
@@ -388,31 +408,58 @@ void loop(){
     startRun(); // ここで UART1.enable
   }
 
-  // レスポンスタイムアウト監視（30秒）
-  if(isRunning && waitingForCommandResponse && (millis()-commandSentTime >= COMMAND_RESPONSE_TIMEOUT_MS)){
-    PC_PRINTLN("[TIMEOUT] No response for 30 seconds - Moving to next command");
-    waitingForCommandResponse=false; logWrite("TIMEOUT: 30s");
-    nextSendEarliestMs=0; // タイムアウト到達時は制約解除
-    advanceWhenReady(); // 次へ
+  // レスポンスタイムアウト監視（個別タイムアウト）
+  if(isRunning && waitingForCommandResponse &&
+     (millis()-commandSentTime >= currentCommandTimeoutMs)){
+    // ==== COPS 特別モード：10秒待ちのタイムアウト時に再送 ====
+    if(isCopsCommandActive && copsAttempts < COPS_MAX_ATTEMPTS){
+      PC_PRINTF("[COPS] Timeout after %lu ms -> retry %d/%d (sawHex=%s)\n",
+                (unsigned long)currentCommandTimeoutMs, copsAttempts+1, COPS_MAX_ATTEMPTS,
+                copsSawHex ? "true":"false");
+      logWrite(String("TIMEOUT: COPS 10s, retry ")+(copsAttempts+1)+"/"+String(COPS_MAX_ATTEMPTS)+
+               (copsSawHex? " (hex seen)":" (hex not seen)"));
+      // 再送（同一コマンド）
+      Serial1.print(currentCommandStr); Serial1.print("\r\n");
+      copsAttempts++;
+      copsSawHex = false;                    // 試行ごとにリセット
+      commandSentTime = millis();
+      responseLineCount=0;
+      waitingForCommandResponse = true;
+      // インデックスは進めない（成功/最終失敗で進める）
+    }else{
+      // ★ 通常コマンドのタイムアウトは次の行へ
+      PC_PRINTLN("[TIMEOUT] No response - Moving to next command");
+      logWrite(String("TIMEOUT: ")+String(currentCommandTimeoutMs/1000)+"s");
+      waitingForCommandResponse=false;
+      // 成否にかかわらず、ここで次の行へ
+      currentLineIndex++;
+      // COPSの場合は特別モード解除
+      if(isCopsCommandActive){
+        isCopsCommandActive=false;
+      }
+      advanceWhenReady(); // 次へ
+    }
   }
 
   // UART1受信・解析（インターバル中は uart1GetLine が false）
   String resp;
   if(uart1GetLine(resp)){
-    // 送信直後の10秒待ち中で、応答待ちは終了済み → ASCII比率が低い行は捨てる
-    if(!waitingForCommandResponse && nextSendEarliestMs>0){
-      if(asciiRatio(resp) < 0.6f){ yield(); return; } // バイナリ/ノイズを捨てる
-    }
     String printable=makePrintable(resp);
     PC_PRINT("[RX<-UART1] "); PC_PRINTLN(printable);
     responseLineCount++;
-
     if(!isRunning && idleHoldDisplay) return;
+
+    // ==== COPS特別処理: ヘックス受信検知（<XX> が含まれる） ====
+    if(isCopsCommandActive && !copsSawHex && containsHexToken(printable)){
+      copsSawHex = true;
+      logWrite("COPS: hex stream detected");
+      // ここでは成功確定しない。OK 応答を待つ。
+    }
 
     // %SOCKETDATAの受信データ抽出（printable基準）
     if(printable.indexOf("%SOCKETDATA:1,13,0,")>=0){
       int startPos=printable.indexOf(",0,")+3;
-      if(startPos>2 && startPos<printable.length()){
+      if(startPos>2 && startPos<(int)printable.length()){
         String tmp=printable.substring(startPos);
         int q1=tmp.indexOf('"'), q2=tmp.lastIndexOf('"');
         if(q1>=0 && q2>q1){
@@ -442,34 +489,69 @@ void loop(){
       lcdPrintLine("RSP: "+d);
     }
 
-    // === ここから“エラー判定の監視対象を限定”する処理 ===
-    // 最終応答を判定（OK / ERROR / +CME ERROR / +CMS ERROR）
-    bool isFinalOK   = (printable == "OK");
-    bool isFinalERR  = (printable == "ERROR" || printable.startsWith("+CME ERROR") || printable.startsWith("+CMS ERROR"));
+    // 完了判定（OK／ERROR）
+    bool isOk    = (printable.indexOf("OK")    >= 0);
+    bool isError = (printable.indexOf("ERROR") >= 0);
 
-    if(isFinalERR){
-      // 監視対象のみ“失敗”としてカウント＆副作用（LED/リセット）を実施
-      if(currentIsMonitored){
-        monitoredFail++;
-        showMismatch();
-        if(!gpio20IsLow){ digitalWrite(20,LOW); gpio20IsLow=true; gpio20LowTime=millis(); PC_PRINTLN("[GPIO20] LOW (ERROR reset sequence started)"); }
-        pendingRestartAfterError=true; lcdClearBeforeNewLine();
-        lcdPrintLine("RSP: ERROR detected"); lcdPrintLine("Reset GPIO20 -> wait 6s");
-        logWrite("EVENT: ERROR detected; GPIO20 LOW; pending restart");
-      }else{
-        // 非監視対象：表示・ログのみ（カウント/リセットなし）
-        logWrite("EVENT: ERROR (non-monitored)");
+    // ---- OK 応答：即次へ（成功）
+    if(isOk){
+      waitingForCommandResponse=false;
+      if(isCopsCommandActive){
+        isCopsCommandActive=false;
       }
-      waitingForCommandResponse=false; advanceWhenReady();
-    }else if(isFinalOK){
-      if(currentIsMonitored){
-        monitoredSuccess++;
-      }
-      waitingForCommandResponse=false; advanceWhenReady();
+      // 成功時に次行へ
+      currentLineIndex++;
+      logWrite("CMD: OK received");
+      advanceWhenReady();
+      // 受信ログ
+      logWrite(String("RSP: ")+printable);
+      yield();
+      return;
     }
-    // === ここまで ===
 
-    // 受信ログ
+    // ---- ERROR 応答：上限までリトライ（共通）
+    if(isError){
+      logWrite(String("RSP: ")+printable);
+      if(errorRetryAttempts < MAX_ERROR_RETRY){
+        PC_PRINTF("[RETRY] ERROR received -> retry %d/%d (cmd=%s)\n",
+                  errorRetryAttempts+1, MAX_ERROR_RETRY, currentCommandStr.c_str());
+        logWrite(String("ERROR: retry ")+(errorRetryAttempts+1)+"/"+String(MAX_ERROR_RETRY));
+        // 再送（同一コマンド）
+        Serial1.print(currentCommandStr); Serial1.print("\r\n");
+        errorRetryAttempts++;
+        // COPSのヘックス検知は試行ごとにリセット（必要に応じて）
+        if(isCopsCommandActive) copsSawHex = false;
+        commandSentTime = millis();
+        responseLineCount=0;
+        waitingForCommandResponse = true;
+        // インデックスは進めない／NG処理もしない
+        yield();
+        return;
+      }else{
+        // 上限到達：ここで初めてNG処理
+        waitingForCommandResponse=false;
+        if(isCopsCommandActive){
+          isCopsCommandActive=false;
+        }
+
+        ngCountRun++; showMismatch();
+        if(!gpio20IsLow){
+          digitalWrite(20,LOW); gpio20IsLow=true; gpio20LowTime=millis();
+          PC_PRINTLN("[GPIO20] LOW (ERROR reset sequence started)");
+        }
+        pendingRestartAfterError=true; lcdClearBeforeNewLine();
+        lcdPrintLine("RSP: ERROR detected (failed after max retries)"); lcdPrintLine("Reset GPIO20 -> wait 6s");
+        logWrite("EVENT: ERROR after max retries; GPIO20 LOW; pending restart");
+
+        // 最終失敗時に次の行へ
+        currentLineIndex++;
+        advanceWhenReady();
+        yield();
+        return;
+      }
+    }
+
+    // 受信ログ（OK/ERROR以外）
     logWrite(String("RSP: ")+printable);
     yield(); // 受信割り込みへCPUを返す
   }
