@@ -297,7 +297,7 @@ void handlePauseSwitchIrqDriven(){
   }
 }
 /* ==================== ファイルロード ==================== */
-// [MOD] --- STEP2対応（既出） ---
+// --- STEP2 対応 & 2回目以降は #STEP2 直後から ---
 uint32_t runCycleCount = 0;
 int step2StartIndexCache = -1;
 int findStep2StartIndex() {
@@ -309,10 +309,9 @@ int findStep2StartIndex() {
   }
   return 0;
 }
-// [MOD] --- ここまで ---
 void loadCommandFile(){
   if(!ensureFS()) return;
-  fs::File file=LittleFS.open("/commands1.txt","r"); // ★ ファイル名を command1s.txt に統一
+  fs::File file=LittleFS.open("/commands1.txt","r"); // ★ ファイル名を commands1.txt に統一
   if(!file){ PC_PRINTLN("[ERROR] Failed to open commands1.txt"); return; }
   commandLines.clear();
   while(file.available()){
@@ -322,7 +321,7 @@ void loadCommandFile(){
   file.close();
   PC_PRINTF("[INFO] Loaded %d lines from commands1.txt\n",(int)commandLines.size());
   commandsLoaded=true;
-  step2StartIndexCache = findStep2StartIndex(); // [MOD]
+  step2StartIndexCache = findStep2StartIndex();
 }
 /* ==================== 画面（アイドル） ==================== */
 void showIdleNextRunScreen(){
@@ -336,22 +335,22 @@ void showIdleNextRunScreen(){
   idleHoldDisplay=true;
 }
 /* ==================== 実行サイクル ==================== */
-// [MOD] エラー検知フラグ（ラン単位）
-bool errorOccurredThisRun = false; // [MOD]
+// ログ保存ポリシー用フラグ
+bool errorOccurredThisRun = false;
 
 void startRun(){
   idleHoldDisplay=false; hasSendData=false; hasReceiveData=false; hasRsrpInfo=false; rsrpInfo="";
   waitingForCommandResponse=false; showIdle();
   lcdClearBeforeNewLine(); lcdPrintLine("Loading commands...");
-  runCycleCount++; // [MOD]
-  errorOccurredThisRun = false; // [MOD] ラン開始時にクリア
+  runCycleCount++;               // 1回目=TOP、2回目以降=STEP2以降
+  errorOccurredThisRun = false;  // ラン開始時にクリア
 
   loadCommandFile();
-  int startIndex = 0; // [MOD]
-  if (runCycleCount >= 2) { // [MOD]
-    startIndex = (step2StartIndexCache >= 0 ? step2StartIndexCache : 0); // [MOD]
-  } // [MOD]
-  currentLineIndex = startIndex; // [MOD]
+  int startIndex = 0;
+  if (runCycleCount >= 2) {
+    startIndex = (step2StartIndexCache >= 0 ? step2StartIndexCache : 0);
+  }
+  currentLineIndex = startIndex;
   if (runCycleCount == 1) { lcdPrintLine("Start: from TOP"); logWrite("RUN START: from TOP"); }
   else {
     if (startIndex > 0) { lcdPrintLine("Start: from #STEP2"); logWrite("RUN START: from #STEP2"); }
@@ -371,39 +370,26 @@ void finishRun(){
   logWrite("RUN END");
   closeLog();
 
-  // [MOD] ここから：ERRORがあれば保存（rename）、なければ削除
-  if (!ensureFS()) return; // 念のため
+  // ログ保管ルール：ERROR (ATエラー / MISMATCH / INCOMPLETE) があれば /logs/error_log_... へ rename、なければ削除
+  if (!ensureFS()) return;
   if (logFilePath.length() == 0) return;
-
   if (errorOccurredThisRun) {
-    // すでに error_log_ が付いているかチェック
     if (logFilePath.indexOf("/logs/error_log_") == 0) {
       PC_PRINTLN("[LOG] Error occurred; file already named with error_log_ (kept)");
     } else {
-      // 新ファイル名を生成（ディレクトリは同一 /logs）
       String baseName = logFilePath.substring(String("/logs/").length());
       String newPath = String("/logs/error_log_") + baseName;
       bool ok = LittleFS.rename(logFilePath, newPath);
-      if (ok) {
-        PC_PRINTF("[LOG] Error occurred; renamed to: %s\n", newPath.c_str());
-        logFilePath = newPath; // 更新
-      } else {
-        PC_PRINTF("[ERROR] Failed to rename log to: %s (kept original)\n", newPath.c_str());
-      }
+      if (ok) { PC_PRINTF("[LOG] Error occurred; renamed to: %s\n", newPath.c_str()); logFilePath = newPath; }
+      else    { PC_PRINTF("[ERROR] Failed to rename log to: %s (kept original)\n", newPath.c_str()); }
     }
   } else {
-    // ERRORが発生していない場合は削除（Pass/NG/Incompleteを問わず）
     if (LittleFS.exists(logFilePath)) {
       bool ok = LittleFS.remove(logFilePath);
-      if (ok) {
-        PC_PRINTF("[LOG] No error; log removed: %s\n", logFilePath.c_str());
-      } else {
-        PC_PRINTF("[ERROR] Failed to remove log: %s\n", logFilePath.c_str());
-      }
+      if (ok) PC_PRINTF("[LOG] No error; log removed: %s\n", logFilePath.c_str());
+      else    PC_PRINTF("[ERROR] Failed to remove log: %s\n", logFilePath.c_str());
     }
   }
-  // [MOD] ここまで
-
 }
 void restartFromTop(){
   PC_PRINTLN("[RESTART] Restarting from line 1");
@@ -433,10 +419,12 @@ void sendNextCommand(){
           showMatch(); passCountRun++; logWrite("RESULT: MATCH");
         } else {
           showMismatch(); ngCountRun++; logWrite("RESULT: MISMATCH");
+          errorOccurredThisRun = true;  // ← [MOD] MISMATCH を ERROR として扱う
         }
       } else {
         logWrite("RESULT: INCOMPLETE (missing send/receive and/or RSRP)");
         showMismatch(); ngCountRun++;
+        errorOccurredThisRun = true;    // ← [MOD] INCOMPLETE も ERROR として扱う
       }
     }
     finishRun(); return;
@@ -504,6 +492,12 @@ void advanceWhenReady(){
   delay(INTER_CMD_DELAY_MS);
   sendNextCommand();
 }
+
+/* ==================== 例外ルール: ALLOCATE,1*** の ERROR 抑止（2回目以降） ==================== */
+inline bool allocate1ExceptionActive() {
+  return (runCycleCount >= 2) && currentCommandStr.startsWith("AT%SOCKETCMD=\"ALLOCATE\",1");
+}
+
 /* ==================== UART1受信（行確定） ==================== */
 static std::vector<uint8_t> uart1Buf;
 static uint32_t uart1LastByteMs=0;
@@ -542,72 +536,15 @@ bool uart1GetLine(String &out){
   }
   return got;
 }
-/* ==================== PC→ESP32：#LIST / #GET / #DELLOG ==================== */
-void handlePcSerialCommands(){
-  static String line;
-  while(Serial.available()){
-    char c=(char)Serial.read();
-    if(c=='\n' || c=='\r'){
-      if(line.length()==0) continue;
-      String cmd=line; line=""; cmd.trim();
-      if(cmd=="#LIST"){
-        fs::File root=LittleFS.open("/logs");
-        if(!root || !root.isDirectory()){ Serial.print("ERR:/logs open failed\r\n"); return; }
-        fs::File f=root.openNextFile();
-        while(f){ Serial.printf("LIST:%s:%u\r\n", f.path(), (unsigned)f.size()); f=root.openNextFile(); }
-        root.close(); Serial.print("LISTEND\r\n"); return;
-      }
-      if(cmd.startsWith("#GET ")){
-        String path=cmd.substring(5); path.trim();
-        fs::File f=LittleFS.open(path,"r");
-        if(!f){ Serial.printf("ERR:open %s failed\r\n", path.c_str()); return; }
-        pcTransferActive=true;
-        size_t sz=f.size();
-        Serial.printf("FILEBEGIN %s %u\r\n", path.c_str(), (unsigned)sz);
-        uint8_t buf[1024];
-        while(f.available()){ size_t n=f.read(buf,sizeof(buf)); Serial.write(buf,n); yield(); }
-        f.close();
-        Serial.print("FILEEND\r\n");
-        pcTransferActive=false; return;
-      }
-      if(cmd=="#DELLOG"){
-        fs::File root=LittleFS.open("/logs");
-        if(!root || !root.isDirectory()){ Serial.print("DELLOG:EMPTY\r\n"); return; }
-        size_t files=0, bytes=0;
-        fs::File f=root.openNextFile();
-        while(f){ String path=f.path(); size_t sz=f.size(); f.close(); if(LittleFS.remove(path)){ files++; bytes+=sz; } f=root.openNextFile(); }
-        root.close(); LittleFS.mkdir("/logs");
-        Serial.printf("DELLOG:OK %u %u\r\n",(unsigned)files,(unsigned)bytes); return;
-      }
-      Serial.print("ERR:unknown cmd\r\n");
-    }else{
-      line+=c;
-    }
-  }
-}
-/* ==================== setup / loop ==================== */
-void setup(){
-  Serial.begin(115200); delay(300);
-  ensureFS(); LittleFS.mkdir("/logs");
-  pinMode(20, OUTPUT); digitalWrite(20, HIGH); PC_PRINTLN("[GPIO20] Set to HIGH");
-  pinMode(GP23_SWITCH_PIN, INPUT_PULLUP);
-  attachInterrupt(GP23_SWITCH_PIN, gp23_isr, FALLING);
-  delay(6000); // LCD 初期化前待機
-  lcd.begin(); lcd.setRotation(1); lcd.setBrightness(220);
-  lcd.setFont(&fonts::Font4); lcd.setTextSize(textSize);
-  lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  lcd.setTextDatum(textdatum_t::top_left);
-  lineHeight=lcd.fontHeight()*textSize;
-  lcdClearBeforeNewLine(); lcdPrintLine("READY - Log + Transfer (interval, UART1 off in idle)");
-  rgb.begin(); rgb.show(); showIdle();
-  lastRunMillis=millis();
-  startRun();
-}
+
+void handlePcSerialCommands();
+
 void loop(){
   handlePcSerialCommands();
   if(pcTransferActive) return;
   handlePauseSwitchIrqDriven();
   if(userPauseEnabled) return;
+
   /* ==== GPIO20 自動復帰（LOW→約1秒→HIGH） ==== */
   if(gpio20IsLow && (millis()-gpio20LowTime >= GPIO20_LOW_DURATION_MS)){
     digitalWrite(20, HIGH); gpio20IsLow=false; PC_PRINTLN("[GPIO20] Set to HIGH (timeout recovery)");
@@ -631,6 +568,7 @@ void loop(){
       return;
     }
   }
+
   /* ==== モジュール復帰待ち（AT→OK 無期限待ち） ==== */
   if (waitingModemReady) {
     unsigned long now = millis();
@@ -640,10 +578,12 @@ void loop(){
     }
     // タイムアウトなし：OK が来るまで待ち続ける
   }
+
   /* ==== 自動実行（インターバル満了） ==== */
   if(!isRunning && !waitingModemReady && (millis()-lastRunMillis >= RUN_INTERVAL_MS)){
     startRun();
   }
+
   /* ==== レスポンスタイムアウト監視（すべて 10 秒） ==== */
   if(isRunning && waitingForCommandResponse &&
      (millis()-commandSentTime >= currentCommandTimeoutMs)){
@@ -665,17 +605,22 @@ void loop(){
       advanceWhenReady();
     }
   }
+
   /* ==== UART1 受信・解析 ==== */
   String resp;
   if(uart1GetLine(resp)){
     String printable=makePrintable(resp);
+    // 例外抑止ではない通常パス：受信をPCへ出力
     PC_PRINT("[RX<-UART1] "); PC_PRINTLN(printable);
+
     responseLineCount++;
     if(!isRunning && idleHoldDisplay) return;
+
     // COPS: HEX 検知（延長はしない。ログのみ）
     if(isCopsCommandActive && printable.indexOf('<')>=0){
       logWrite("COPS: hex-like stream detected");
     }
+
     // 受信 %SOCKETDATA の汎用抽出
     int rcid=0, rlen=0, rflags=0; String rpayloadRaw;
     if(parseSocketdataRx(printable, rcid, rlen, rflags, rpayloadRaw)){
@@ -686,8 +631,10 @@ void loop(){
       PC_PRINTF("[INFO] RECEIVE cid=%d len=%d flags=%d payload_norm(<=26): %s\n", rcid, rlen, rflags, receiveDataString.c_str());
       logWrite(String("RECEIVE PAYLOAD (cid=")+rcid+", len="+rlen+", flags="+rflags+"): "+receiveDataString);
     }
+
     // +CCLK
     if(printable.indexOf("+CCLK:")>=0){ currentClockStr=printable; hasClockFromModem=true; logWrite(String("CLOCK UPDATE: ")+printable); }
+
     // RSRP
     if(printable.indexOf("RSRP: Reported")>=0){
       int s=printable.indexOf("RSRP: Reported"), c=printable.indexOf(',',s);
@@ -697,20 +644,17 @@ void loop(){
       PC_PRINTF("[INFO] RSRP info captured: %s\n", rsrpInfo.c_str());
       logWrite(String("RSRP: ")+rsrpInfo);
     }
+
     // LCD 短縮表示
     if(printable.length()>0){
       String d=(printable.length()>20)? printable.substring(0,17)+"..." : printable;
       lcdPrintLine("RSP: "+d);
     }
+
     // 完了判定（OK／ERROR）：完全一致＋URC分離
     String line = printable; line.trim();
     bool isOk = (line == "OK");
     bool isError = (line == "ERROR");
-
-    // [MOD] ERROR検知（URC/応答待ち問わず）→フラグON
-    if(isError) {
-      errorOccurredThisRun = true; // [MOD]
-    }
 
     // 復帰待ち（AT→OK）完了フック
     if(isOk && waitingModemReady){
@@ -722,6 +666,7 @@ void loop(){
       yield();
       return;
     }
+
     // OK：成功（応答待ちのときのみ遷移）。待ちでなければ URC としてログのみ。
     if(isOk){
       if (waitingForCommandResponse){
@@ -737,8 +682,21 @@ void loop(){
       yield();
       return;
     }
-    // ERROR：応答待ちのときだけリトライ。待ちでなければ URC として記録のみ。
+
+    // 2回目以降の ALLOCATE,1*** 例外：ERROR を無視して次へ（ログ・シリアル抑止）
+    if(isError && (runCycleCount >= 2) && currentCommandStr.startsWith("AT%SOCKETCMD=\"ALLOCATE\",1")){
+      // エラー履歴を残さずスキップするため、ここではログ出力も行わない（[要件準拠]）
+      waitingForCommandResponse=false;
+      if(isCopsCommandActive) isCopsCommandActive=false;
+      currentLineIndex++;
+      advanceWhenReady();
+      yield();
+      return;
+    }
+
+    // 通常の ERROR 処理
     if(isError){
+      errorOccurredThisRun = true; // AT応答としての ERROR はエラー扱い
       if (!waitingForCommandResponse){
         logWrite(String("URC: ")+printable);
         yield();
@@ -746,7 +704,7 @@ void loop(){
       }
       logWrite(String("RSP: ")+printable);
       if(errorRetryAttempts < MAX_ERROR_RETRY){
-        // ここで ALLOCATE エラー時の 1 秒待機も適用済み（前回の改修）
+        // ALLOCATE の ERROR は再送前に 1 秒待機（例外に該当しない場合のみ）
         if (currentCommandStr.startsWith("AT%SOCKETCMD=\"ALLOCATE\"")) {
           PC_PRINTLN("[RETRY] ERROR on ALLOCATE -> wait 1000ms then retry");
           logWrite("RETRY: ALLOCATE ERROR -> wait 1000ms before resend");
@@ -780,6 +738,8 @@ void loop(){
         return;
       }
     }
+
+    // その他の行はログへ
     logWrite(String("RSP: ")+printable);
     yield();
   }
