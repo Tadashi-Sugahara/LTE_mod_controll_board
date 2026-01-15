@@ -5,7 +5,7 @@
  * - ログ: /logs/atlog_YYYYMMDD_HHMMSS.txt（+CCLK 時刻／なければ millis）
  * - PC→ESP32: #LIST / #GET <path> / #DELLOG（FILEBEGIN size + 本体 + FILEEND）
  *
- * 主要仕様（2026-01-08版 + 要望反映）
+ * 主要仕様（2026-01-15版 + 要望反映）
  * - 全 AT コマンドの個別タイムアウトは 10 秒に統一（COPS も 10s/試行・延長なし）
  * - コマンド間の待ち時間は 1,000ms（advanceWhenReady）
  * - /commands1.txt に "WAIT <msec>" 行を記述すると、その msec だけ delay。表示は LCD のみ（ログ・PC出力なし）
@@ -16,6 +16,7 @@
  * - 復帰：GPIO20 LOW→約1秒→HIGH→固定6秒→AT→OK 無期限待ちで再開
  * - AT%SOCKETCMD="ALLOCATE" の ERROR リトライ前は 1 秒待機
  * - 2回目以降は AT%SOCKETCMD="ALLOCATE",1*** の ERROR を完全無視（ログ/シリアル出力せずに次へ）
+ * - 実行間隔は30min
  */
 
 #include <Arduino.h>
@@ -73,7 +74,7 @@ unsigned long lastRunMillis=0;
 
 /* ==== タイムアウト・間隔 ==== */
 const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 10000UL; // 10s
-const unsigned long RUN_INTERVAL_MS            = 10000UL;  // 周期実行間隔
+const unsigned long RUN_INTERVAL_MS            = 1800000UL;  // 周期実行間隔
 const unsigned long INTER_CMD_DELAY_MS         = 1000UL;   // コマンド間
 uint32_t ngCountRun=0, passCountRun=0;
 
@@ -350,7 +351,7 @@ void showIdleNextRunScreen(){
   else if(hasLastRsrp && lastRsrpInfo.length()>0){ rsrpLine=lastRsrpInfo; }
   else { rsrpLine="RSRP: N/A"; }
   lcdPrintLine(rsrpLine);
-  lcdPrintLine(String("Next run in ") + (RUN_INTERVAL_MS/1000) + " seconds...");
+  lcdPrintLine(String("Next run in ") + (RUN_INTERVAL_MS/60000) + " minitues...");
   idleHoldDisplay=true;
 }
 
