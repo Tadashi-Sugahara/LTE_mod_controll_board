@@ -1,18 +1,22 @@
 
 /*
- * ESP32-C6: LittleFS の /command1.txt から AT コマンドを順次実行（UART1）
+ * ESP32-C6: LittleFS の /commands1.txt から AT コマンドを順次実行（UART1）
  * - LCD（LovyanGFX/ST7789）へ CMD/RSP 表示、WS2812 で結果表示
  * - ログ: /logs/atlog_YYYYMMDD_HHMMSS.txt（+CCLK 時刻／なければ millis）
  * - PC→ESP32: #LIST / #GET <path> / #DELLOG（FILEBEGIN size + 本体 + FILEEND）
  *
- * 主要仕様（2026-01-08版）
- * - ★ 全 AT コマンドの個別タイムアウトは 10 秒に統一（COPS も 10s/試行・延長なし）
- * - ★ コマンド間の待ち時間は 1,000ms（advanceWhenReady）
- * - ★ /command1.txt に "WAIT <msec>" 行を記述すると、その msec だけ delay。表示は LCD のみ（ログ・PC出力なし）
+ * 主要仕様（2026-01-15版 + 要望反映）
+ * - 全 AT コマンドの個別タイムアウトは 10 秒に統一（COPS も 10s/試行・延長なし）
+ * - コマンド間の待ち時間は 1,000ms（advanceWhenReady）
+ * - /commands1.txt に "WAIT <msec>" 行を記述すると、その msec だけ delay。表示は LCD のみ（ログ・PC出力なし）
+ * - 2回目以降の実行は #STEP2 の次行から開始（見つからなければ先頭）
  * - 送受一致判定：送受ペイロードを同じ規則（makePrintable）で正規化して比較（受信HEX→バイト化）
  * - Pass拡張：途中ERRORがあっても「送受抽出＋RSRP取得」達成で青LED・カウントアップ
+ * - MISMATCH/INCOMPLETE は“エラー扱い”としてログ保存（error_log_）＋NGカウント＋赤LED
  * - 復帰：GPIO20 LOW→約1秒→HIGH→固定6秒→AT→OK 無期限待ちで再開
- * - 表示「Next run in ...」は RUN_INTERVAL_MS に追従
+ * - AT%SOCKETCMD="ALLOCATE" の ERROR リトライ前は 1 秒待機
+ * - 2回目以降は AT%SOCKETCMD="ALLOCATE",1*** の ERROR を完全無視（ログ/シリアル出力せずに次へ）
+ * - 実行間隔は30min
  */
 
 #include <Arduino.h>
@@ -21,6 +25,7 @@
 #include <LovyanGFX.hpp>
 #include <Adafruit_NeoPixel.h>
 #include <vector>
+#include "lte_mod.h"
 
 #if defined(ESP32)
   #include "freertos/FreeRTOS.h"
@@ -41,8 +46,8 @@ bool pcTransferActive = false;
 #define RGB_COUNT 1
 Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_RGB + NEO_KHZ800);
 inline void rgbSet(uint8_t r, uint8_t g, uint8_t b){ rgb.setPixelColor(0, rgb.Color(r,g,b)); rgb.show(); }
-inline void showMatch()    { rgbSet(0, 0, 255); }  // 青
-inline void showMismatch() { rgbSet(255, 0, 0); }  // 赤
+inline void showMatch()    { rgbSet(0, 0, 255); } // 青
+inline void showMismatch() { rgbSet(255, 0, 0); } // 赤
 inline void showIdle()     { rgbSet(0, 0, 0); }
 
 class LGFX_ESP32C6_WS : public lgfx::LGFX_Device{
@@ -60,7 +65,6 @@ public:
   }
 };
 LGFX_ESP32C6_WS lcd;
-
 static const int margin=8;
 int cursorX=margin, cursorY=margin;
 int lineHeight=0, textSize=1;
@@ -69,17 +73,15 @@ bool isRunning=false;
 bool idleHoldDisplay=false;
 unsigned long lastRunMillis=0;
 
-/* ==== タイムアウトを 10 秒に統一 ==== */
-const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 10000UL; // 既定 10s
-const unsigned long RUN_INTERVAL_MS = 10000UL;             // 次周期までのインターバル（表示追従）
-/* ==== コマンド間の待ち時間（200ms → 1000ms） ==== */
-const unsigned long INTER_CMD_DELAY_MS = 1000UL;
-
+/* ==== タイムアウト・間隔 ==== */
+const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 10000UL; // 10s
+const unsigned long RUN_INTERVAL_MS            = 1800000UL;  // 周期実行間隔 (30 min x 60,000 msec)
+const unsigned long INTER_CMD_DELAY_MS         = 1000UL;   // コマンド間
 uint32_t ngCountRun=0, passCountRun=0;
 
 /* ==== ERROR 復帰用 GPIO20 ==== */
 unsigned long gpio20LowTime=0; bool gpio20IsLow=false;
-const unsigned long GPIO20_LOW_DURATION_MS=1000;           // LOW→HIGH 自動復帰まで約 1 秒
+const unsigned long GPIO20_LOW_DURATION_MS=1000; // LOW→約1秒後HIGH
 bool pendingRestartAfterError=false;
 
 /* ==== RSRP 情報 ==== */
@@ -89,9 +91,9 @@ String rsrpInfo=""; bool hasRsrpInfo=false; String lastRsrpInfo=""; bool hasLast
 bool waitingModemReady = false;
 unsigned long modemReadyWaitStartMs = 0;
 unsigned long lastProbeMs = 0;
-const unsigned long PROBE_INTERVAL_MS = 500;               // 500ms おきに AT 送信（無期限）
+const unsigned long PROBE_INTERVAL_MS = 500; // 500ms 毎に AT
 
-/* ==================== GP23: 押すと Low の割り込みスイッチ ==================== */
+/* ==================== GP23: 割り込みスイッチ ==================== */
 #define GP23_SWITCH_PIN 23
 bool userPauseEnabled = false;
 volatile bool gp23IsrEvent = false;
@@ -99,7 +101,7 @@ static bool swDebouncing = false;
 static unsigned long swDebounceStartMs = 0;
 static unsigned long lastSwitchHandledMs = 0;
 const unsigned long SWITCH_DEBOUNCE_MS = 30;
-const unsigned long SWITCH_LOCK_MS    = 5000;
+const unsigned long SWITCH_LOCK_MS     = 5000;
 
 void IRAM_ATTR gp23_isr(){
 #if defined(ESP32)
@@ -172,114 +174,6 @@ void lcdClearBeforeNewLine(bool drawHeader=true){ lcd.fillScreen(TFT_BLACK); cur
 void lcdNewLine(){ cursorX=margin; cursorY+=lineHeight; if(cursorY>lcd.height()-margin-lineHeight) lcdClearBeforeNewLine(); }
 void lcdPrintLine(const String& line){ lcd.setCursor(cursorX,cursorY); lcd.print(line); lcdNewLine(); }
 
-/* ==================== 受信フィルタ（ASCII/HEX化） ==================== */
-String makePrintable(const String& s){
-  String out; out.reserve(s.length()*2);
-  for(size_t i=0;i<s.length();++i){
-    uint8_t b=(uint8_t)s[i];
-    if(b=='\r' || b=='\n' || (b>=0x20 && b<=0x7E)) out+=(char)b;
-    else { char hx[5]; snprintf(hx,sizeof(hx),"<%02X>",b); out+=hx; }
-  }
-  return out;
-}
-
-/* ===== HEXユーティリティ ===== */
-inline bool isHexNibble(char c){ return (c>='0'&&c<='9')||(c>='A'&&c<='F')||(c>='a'&&c<='f'); }
-inline int hexVal(char c){
-  if(c>='0'&&c<='9') return c-'0';
-  if(c>='A'&&c<='F') return 10+(c-'A');
-  if(c>='a'&&c<='f') return 10+(c-'a');
-  return -1;
-}
-bool isPureHexString(const String& s){
-  if(s.length()==0 || (s.length()%2)!=0) return false;
-  for(size_t i=0;i<s.length();++i){ if(!isHexNibble(s[i])) return false; }
-  return true;
-}
-String hexToBytesString(const String& hex){
-  String out; out.reserve(hex.length()/2);
-  for(size_t i=0;i<hex.length(); i+=2){
-    int hi=hexVal(hex[i]), lo=hexVal(hex[i+1]);
-    if(hi<0||lo<0){ break; }
-    char b=(char)((hi<<4)|lo);
-    out+=b;
-  }
-  return out;
-}
-
-/* ==================== %SOCKETDATA パーサ（送受共通） ==================== */
-// 受信例: %SOCKETDATA:<cid>,<len>,<flags>,"<payload>",...
-bool parseSocketdataRx(const String& line, int& cid, int& len, int& flags, String& payloadRaw){
-  int p=line.indexOf("%SOCKETDATA:");
-  if(p<0) return false;
-  int q1=line.indexOf('"', p);
-  int q2=line.lastIndexOf('"');
-  String prefix=line.substring(p+12, q1); // after "%SOCKETDATA:" up to first quote
-  prefix.trim();
-  int c1=prefix.indexOf(','); if(c1<0) return false;
-  cid = prefix.substring(0,c1).toInt();
-  int c2=prefix.indexOf(',', c1+1); if(c2<0) return false;
-  len = prefix.substring(c1+1,c2).toInt();
-  int c3=prefix.indexOf(',', c2+1); if(c3<0) return false;
-  flags = prefix.substring(c2+1,c3).toInt();
-  if(q1<0 || q2<=q1) return false;
-  payloadRaw = line.substring(q1+1,q2);
-  return true;
-}
-
-// 送信例: AT%SOCKETDATA="SEND",<cid>,<len>,"<payload>"
-bool parseSocketdataSendCmd(const String& cmd, int& cid, int& len, String& payloadRaw){
-  int p=cmd.indexOf("AT%SOCKETDATA=\"SEND\"");
-  if(p<0) return false;
-  int q2=cmd.lastIndexOf('"');               // last quote = payload closing
-  int q1=cmd.lastIndexOf('"', q2-1);         // previous quote = payload opening
-  if(q1<0 || q2<=q1) return false;
-  payloadRaw = cmd.substring(q1+1, q2);
-  int c2=cmd.lastIndexOf(',', q1-1);         // comma before payload opening -> len separator
-  int c1=cmd.lastIndexOf(',', c2-1);         // previous comma -> cid separator
-  if(c1<0 || c2<0) return false;
-  len = cmd.substring(c1+1, c2).toInt();
-  int c0=cmd.lastIndexOf(',', c1-1); if(c0<0) return false;
-  cid = cmd.substring(c0+1, c1).toInt();
-  return true;
-}
-
-/* ==================== 送受ペイロードの正規化（比較用） ==================== */
-String normalizePayloadForCompare_FromSend(const String& payloadAscii){
-  return makePrintable(payloadAscii); // 送信はASCII前提を可視化ルールへ
-}
-String normalizePayloadForCompare_FromRx(const String& payloadRaw){
-  if(isPureHexString(payloadRaw)){
-    String bytes = hexToBytesString(payloadRaw);
-    return makePrintable(bytes);
-  }else{
-    return makePrintable(payloadRaw);
-  }
-}
-
-/* ==================== ATコマンド実行（COPS特別処理＋共通 ERROR リトライ） ==================== */
-static int currentLineIndex=0;
-static std::vector<String> commandLines;
-bool commandsLoaded=false, waitingForCommandResponse=false;
-unsigned long commandSentTime=0;
-
-String currentCommandStr="";
-unsigned long currentCommandTimeoutMs=COMMAND_RESPONSE_TIMEOUT_MS;
-
-/* ==== COPS モード ==== */
-bool isCopsCommandActive=false;
-int  copsAttempts=0;
-bool copsSawHex=false;
-const int COPS_MAX_ATTEMPTS = 10;                // リトライ上限（10回）
-const unsigned long COPS_TIMEOUT_PER_TRY_MS = 10000UL; // 常に 10s（延長廃止）
-
-/* ==== ERROR リトライ ==== */
-int errorRetryAttempts = 0;
-const int MAX_ERROR_RETRY = 10;
-
-/* ==== 送受比較用（正規化済みで保持） ==== */
-String sendDataString="", receiveDataString="";
-bool hasSendData=false, hasReceiveData=false;
 
 /* ==================== UART1 制御 ==================== */
 static const uint32_t BAUD_PC=115200, BAUD_UART=115200;
@@ -287,7 +181,7 @@ static const int UART1_TX_PIN=18, UART1_RX_PIN=19;
 void uart1Enable(){ Serial1.begin(BAUD_UART, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN); Serial1.setRxBufferSize(4096); PC_PRINTLN("[UART1] Enabled"); }
 void uart1Disable(){ Serial1.end(); PC_PRINTLN("[UART1] Disabled"); }
 
-/* ==================== GP23: 中断／再開 ==================== */
+/* ==================== GP23: 中断/再開 ==================== */
 void pauseProcessing(){
   if (userPauseEnabled) return;
   userPauseEnabled = true;
@@ -331,10 +225,22 @@ void handlePauseSwitchIrqDriven(){
   }
 }
 
-/* ==================== ファイルロード ==================== */
+/* ==================== ファイルロード & STEP2 対応 ==================== */
+uint32_t runCycleCount = 0; // 1回目=TOP、2回目以降=STEP2以降
+int step2StartIndexCache = -1;
+
+int findStep2StartIndex() {
+  for (size_t i=0; i<commandLines.size(); ++i) {
+    String line = commandLines[i];
+    if (line.startsWith("#STEP2")) {
+      return (int)i + 1; // 次行
+    }
+  }
+  return 0;
+}
 void loadCommandFile(){
   if(!ensureFS()) return;
-  fs::File file=LittleFS.open("/commands1.txt","r");  // ★ ファイル名を command1s.txt に統一
+  fs::File file=LittleFS.open("/commands1.txt","r");
   if(!file){ PC_PRINTLN("[ERROR] Failed to open commands1.txt"); return; }
   commandLines.clear();
   while(file.available()){
@@ -343,7 +249,8 @@ void loadCommandFile(){
   }
   file.close();
   PC_PRINTF("[INFO] Loaded %d lines from commands1.txt\n",(int)commandLines.size());
-  commandsLoaded=true; currentLineIndex=0;
+  commandsLoaded=true;
+  step2StartIndexCache = findStep2StartIndex();
 }
 
 /* ==================== 画面（アイドル） ==================== */
@@ -354,30 +261,66 @@ void showIdleNextRunScreen(){
   else if(hasLastRsrp && lastRsrpInfo.length()>0){ rsrpLine=lastRsrpInfo; }
   else { rsrpLine="RSRP: N/A"; }
   lcdPrintLine(rsrpLine);
-  lcdPrintLine(String("Next run in ") + (RUN_INTERVAL_MS/1000) + " seconds...");
+  lcdPrintLine(String("Next run in ") + (RUN_INTERVAL_MS/60000) + " minitues...");
   idleHoldDisplay=true;
 }
 
-/* ==================== 実行サイクル ==================== */
+/* ==================== 実行サイクル（ログ保存ポリシー含む） ==================== */
+bool errorOccurredThisRun = false; // ラン単位エラーフラグ（AT ERROR / MISMATCH / INCOMPLETE）
+
 void startRun(){
   idleHoldDisplay=false; hasSendData=false; hasReceiveData=false; hasRsrpInfo=false; rsrpInfo="";
   waitingForCommandResponse=false; showIdle();
   lcdClearBeforeNewLine(); lcdPrintLine("Loading commands...");
+  runCycleCount++;
+  errorOccurredThisRun = false;
+
   loadCommandFile();
+
+  int startIndex = 0;
+  if (runCycleCount >= 2) { startIndex = (step2StartIndexCache >= 0 ? step2StartIndexCache : 0); }
+  currentLineIndex = startIndex;
+
+  if (runCycleCount == 1) { lcdPrintLine("Start: from TOP");      logWrite("RUN START: from TOP"); }
+  else {
+    if (startIndex > 0)   { lcdPrintLine("Start: from #STEP2");   logWrite("RUN START: from #STEP2"); }
+    else                  { lcdPrintLine("Start: #STEP2 not found -> TOP"); logWrite("RUN START: #STEP2 not found -> TOP"); }
+  }
+
   uart1Enable();
   isRunning=true; delay(300);
   openNewLog(); logWrite("RUN START");
   sendNextCommand();
 }
-
 void finishRun(){
   uart1Disable();
   isRunning=false; lastRunMillis=millis();
   showIdleNextRunScreen();
   PC_PRINTLN("[INFO] Waiting for next run interval");
-  logWrite("RUN END"); closeLog();
-}
+  logWrite("RUN END");
+  closeLog();
 
+  // ログ保存ポリシー：エラー（AT ERROR / MISMATCH / INCOMPLETE）なら保存、なければ削除
+  if (!ensureFS()) return;
+  if (logFilePath.length() == 0) return;
+  if (errorOccurredThisRun) {
+    if (logFilePath.indexOf("/logs/error_log_") == 0) {
+      PC_PRINTLN("[LOG] Error occurred; file already named with error_log_ (kept)");
+    } else {
+      String baseName = logFilePath.substring(String("/logs/").length());
+      String newPath = String("/logs/error_log_") + baseName;
+      bool ok = LittleFS.rename(logFilePath, newPath);
+      if (ok) { PC_PRINTF("[LOG] Error occurred; renamed to: %s\n", newPath.c_str()); logFilePath = newPath; }
+      else    { PC_PRINTF("[ERROR] Failed to rename log to: %s (kept original)\n", newPath.c_str()); }
+    }
+  } else {
+    if (LittleFS.exists(logFilePath)) {
+      bool ok = LittleFS.remove(logFilePath);
+      if (ok) PC_PRINTF("[LOG] No error; log removed: %s\n", logFilePath.c_str());
+      else    PC_PRINTF("[ERROR] Failed to remove log: %s\n", logFilePath.c_str());
+    }
+  }
+}
 void restartFromTop(){
   PC_PRINTLN("[RESTART] Restarting from line 1");
   idleHoldDisplay=false; isRunning=true; waitingForCommandResponse=false;
@@ -391,106 +334,127 @@ void restartFromTop(){
 }
 
 /* ==================== コマンド送出 ==================== */
+void advanceWhenReady(){ delay(INTER_CMD_DELAY_MS); sendNextCommand(); }
 void sendNextCommand(){
   if(!commandsLoaded || currentLineIndex >= (int)commandLines.size()){
     PC_PRINTLN("[INFO] All commands completed");
-
-    // --- Pass 判定（途中 ERROR があっても、送受抽出＋RSRP取得で Pass） ---
     bool rsrpObtained = (hasRsrpInfo || hasLastRsrp);
     if (hasSendData && hasReceiveData && rsrpObtained) {
-      showMatch();                 // 青LED
-      passCountRun++;              // Pass カウントアップ
+      showMatch(); passCountRun++;
       logWrite("RESULT: PASS_BY_COMPLETION (send/receive/RSRP obtained)");
     } else {
-      // 従来の比較ロジック（正規化済み文字列で比較）
       if(hasSendData && hasReceiveData){
         if(sendDataString.equals(receiveDataString)){
           showMatch(); passCountRun++; logWrite("RESULT: MATCH");
         } else {
           showMismatch(); ngCountRun++; logWrite("RESULT: MISMATCH");
+          errorOccurredThisRun = true;  // MISMATCH をエラー扱い
         }
       } else {
         logWrite("RESULT: INCOMPLETE (missing send/receive and/or RSRP)");
         showMismatch(); ngCountRun++;
+        errorOccurredThisRun = true;    // INCOMPLETE もエラー扱い
       }
     }
-
     finishRun(); return;
   }
 
   String command=commandLines[currentLineIndex];
 
-  // === コメント行 ===
-  if(command.startsWith("#")){
+  if(command.startsWith("#")){ currentLineIndex++; sendNextCommand(); return; } // コメント
+  if(command.startsWith("WAIT")){
+    int sp = command.indexOf(' '); unsigned long waitMs = 0;
+    if(sp > 0){ String msStr = command.substring(sp+1); msStr.trim(); waitMs = (unsigned long)msStr.toInt(); }
+    lcdClearBeforeNewLine(); lcdPrintLine(String("WAIT ") + waitMs + " ms...");
+    delay(waitMs);
     currentLineIndex++; sendNextCommand(); return;
   }
 
-  // === ★ WAIT 命令（LCD表示のみ／ログ・PC出力なし） ===
-  if(command.startsWith("WAIT")){
-    int sp = command.indexOf(' ');
-    unsigned long waitMs = 0;
-    if(sp > 0){
-      String msStr = command.substring(sp+1); msStr.trim();
-      waitMs = (unsigned long)msStr.toInt();
-    }
-    // LCDにのみ表示
-    lcdClearBeforeNewLine();
-    lcdPrintLine(String("WAIT ") + waitMs + " ms...");
-    // 実際の待機
-    delay(waitMs);
-    // 次行へ
-    currentLineIndex++;
-    sendNextCommand();
-    return;
-  }
-
-  // ★ SENDペイロード抽出（汎用化）
+  // %SOCKETDATA SEND の payload を抽出（比較用に正規化保持）
   int scid=0, slen=0; String spayloadRaw;
   bool isSendCmd = parseSocketdataSendCmd(command, scid, slen, spayloadRaw);
   if(isSendCmd){
-    String spNorm = normalizePayloadForCompare_FromSend(spayloadRaw);
+    String spNorm = makePrintable(spayloadRaw);
     if(spNorm.length()>26) spNorm = spNorm.substring(0,26);
-    sendDataString = spNorm;
-    hasSendData = true;
+    sendDataString = spNorm; hasSendData = true;
     PC_PRINTF("[INFO] SEND cid=%d len=%d payload_norm(<=26): %s\n", scid, slen, sendDataString.c_str());
     logWrite(String("SEND PAYLOAD (cid=")+scid+", len="+slen+"): "+sendDataString);
   }
 
-  // 送信表示＆UART1送信
+  // 送信
   lcdClearBeforeNewLine(); lcdPrintLine("CMD: "+command);
   PC_PRINTF("[TX->UART1] %s\n", command.c_str());
   Serial1.print(command); Serial1.print("\r\n");
-
   currentCommandStr = command;
   waitingForCommandResponse=true;
   commandSentTime=millis();
   responseLineCount=0;
   errorRetryAttempts = 0;
 
-  // ★ 個別タイムアウト設定（すべて 10 秒）
+  // タイムアウト設定
   if(command.equals("AT+COPS=1,2,\"44020\"")){
-    isCopsCommandActive = true;
-    copsAttempts = 1;
-    copsSawHex = false;
-    currentCommandTimeoutMs = COPS_TIMEOUT_PER_TRY_MS; // 10s/試行
+    isCopsCommandActive = true; copsAttempts = 1; copsSawHex = false;
+    currentCommandTimeoutMs = COPS_TIMEOUT_PER_TRY_MS;
     logWrite("COPS: special handling started (timeout=10s per try, no extension)");
   }else{
-    isCopsCommandActive = false;
-    copsAttempts = 0; copsSawHex = false;
-    currentCommandTimeoutMs = COMMAND_RESPONSE_TIMEOUT_MS; // 通常も 10s（統一）
+    isCopsCommandActive = false; copsAttempts = 0; copsSawHex = false;
+    currentCommandTimeoutMs = COMMAND_RESPONSE_TIMEOUT_MS;
     logWrite("DEFAULT: per-command response timeout = 10s");
   }
-
   logWrite(String("CMD: ")+command);
 }
 
-void advanceWhenReady(){
-  // ★ 200ms → 1000ms に変更
-  delay(INTER_CMD_DELAY_MS);
-  sendNextCommand();
+/* ==================== 例外ルール: ALLOCATE,1*** の ERROR 抑止（2回目以降） ==================== */
+inline bool allocate1ExceptionActive() {
+  return (runCycleCount >= 2) && currentCommandStr.startsWith("AT%SOCKETCMD=\"ALLOCATE\",1");
 }
 
-/* ==================== UART1受信（行確定） ==================== */
+/* ==================== PC→ESP32：#LIST / #GET / #DELLOG（loopより前に定義） ==================== */
+void handlePcSerialCommands(){
+  static String line;
+  while(Serial.available()){
+    char c=(char)Serial.read();
+    if(c=='\n' || c=='\r'){
+      if(line.length()==0) continue;
+      String cmd=line; line=""; cmd.trim();
+
+      if(cmd=="#LIST"){
+        fs::File root=LittleFS.open("/logs");
+        if(!root || !root.isDirectory()){ Serial.print("ERR:/logs open failed\r\n"); return; }
+        fs::File f=root.openNextFile();
+        while(f){ Serial.printf("LIST:%s:%u\r\n", f.path(), (unsigned)f.size()); f=root.openNextFile(); }
+        root.close(); Serial.print("LISTEND\r\n"); return;
+      }
+      if(cmd.startsWith("#GET ")){
+        String path=cmd.substring(5); path.trim();
+        fs::File f=LittleFS.open(path,"r");
+        if(!f){ Serial.printf("ERR:open %s failed\r\n", path.c_str()); return; }
+        pcTransferActive=true;
+        size_t sz=f.size();
+        Serial.printf("FILEBEGIN %s %u\r\n", path.c_str(), (unsigned)sz);
+        uint8_t buf[1024];
+        while(f.available()){ size_t n=f.read(buf,sizeof(buf)); Serial.write(buf,n); yield(); }
+        f.close();
+        Serial.print("FILEEND\r\n");
+        pcTransferActive=false; return;
+      }
+      if(cmd=="#DELLOG"){
+        fs::File root=LittleFS.open("/logs");
+        if(!root || !root.isDirectory()){ Serial.print("DELLOG:EMPTY\r\n"); return; }
+        size_t files=0, bytes=0;
+        fs::File f=root.openNextFile();
+        while(f){ String path=f.path(); size_t sz=f.size(); f.close(); if(LittleFS.remove(path)){ files++; bytes+=sz; } f=root.openNextFile(); }
+        root.close(); LittleFS.mkdir("/logs");
+        Serial.printf("DELLOG:OK %u %u\r\n",(unsigned)files,(unsigned)bytes); return;
+      }
+      Serial.print("ERR:unknown cmd\r\n");
+    }else{
+      line+=c;
+    }
+  }
+}
+
+/* ==================== UART1受信（行確定）…通常関数として定義 ==================== */
 static std::vector<uint8_t> uart1Buf;
 static uint32_t uart1LastByteMs=0;
 static const uint32_t UART1_GAP_MS=15;
@@ -530,71 +494,26 @@ bool uart1GetLine(String &out){
   return got;
 }
 
-/* ==================== PC→ESP32：#LIST / #GET / #DELLOG ==================== */
-void handlePcSerialCommands(){
-  static String line;
-  while(Serial.available()){
-    char c=(char)Serial.read();
-    if(c=='\n' || c=='\r'){
-      if(line.length()==0) continue;
-      String cmd=line; line=""; cmd.trim();
-      if(cmd=="#LIST"){
-        fs::File root=LittleFS.open("/logs");
-        if(!root || !root.isDirectory()){ Serial.print("ERR:/logs open failed\r\n"); return; }
-        fs::File f=root.openNextFile();
-        while(f){ Serial.printf("LIST:%s:%u\r\n", f.path(), (unsigned)f.size()); f=root.openNextFile(); }
-        root.close(); Serial.print("LISTEND\r\n"); return;
-      }
-      if(cmd.startsWith("#GET ")){
-        String path=cmd.substring(5); path.trim();
-        fs::File f=LittleFS.open(path,"r");
-        if(!f){ Serial.printf("ERR:open %s failed\r\n", path.c_str()); return; }
-        pcTransferActive=true;
-        size_t sz=f.size();
-        Serial.printf("FILEBEGIN %s %u\r\n", path.c_str(), (unsigned)sz);
-        uint8_t buf[1024];
-        while(f.available()){ size_t n=f.read(buf,sizeof(buf)); Serial.write(buf,n); yield(); }
-        f.close();
-        Serial.print("FILEEND\r\n");
-        pcTransferActive=false; return;
-      }
-      if(cmd=="#DELLOG"){
-        fs::File root=LittleFS.open("/logs");
-        if(!root || !root.isDirectory()){ Serial.print("DELLOG:EMPTY\r\n"); return; }
-        size_t files=0, bytes=0;
-        fs::File f=root.openNextFile();
-        while(f){ String path=f.path(); size_t sz=f.size(); f.close(); if(LittleFS.remove(path)){ files++; bytes+=sz; } f=root.openNextFile(); }
-        root.close(); LittleFS.mkdir("/logs");
-        Serial.printf("DELLOG:OK %u %u\r\n",(unsigned)files,(unsigned)bytes); return;
-      }
-      Serial.print("ERR:unknown cmd\r\n");
-    }else{
-      line+=c;
-    }
-  }
-}
-
 /* ==================== setup / loop ==================== */
 void setup(){
   Serial.begin(115200); delay(300);
   ensureFS(); LittleFS.mkdir("/logs");
-
   pinMode(20, OUTPUT); digitalWrite(20, HIGH); PC_PRINTLN("[GPIO20] Set to HIGH");
-
   pinMode(GP23_SWITCH_PIN, INPUT_PULLUP);
   attachInterrupt(GP23_SWITCH_PIN, gp23_isr, FALLING);
 
-  delay(6000); // LCD 初期化前待機
+  delay(2000); // LCD 初期化前待機
   lcd.begin(); lcd.setRotation(1); lcd.setBrightness(220);
   lcd.setFont(&fonts::Font4); lcd.setTextSize(textSize);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setTextDatum(textdatum_t::top_left);
   lineHeight=lcd.fontHeight()*textSize;
+
   lcdClearBeforeNewLine(); lcdPrintLine("READY - Log + Transfer (interval, UART1 off in idle)");
-
   rgb.begin(); rgb.show(); showIdle();
-  lastRunMillis=millis();
 
+  delay(3000); // LCD 初期化前待機
+  lastRunMillis=millis();
   startRun();
 }
 
@@ -609,7 +528,6 @@ void loop(){
   if(gpio20IsLow && (millis()-gpio20LowTime >= GPIO20_LOW_DURATION_MS)){
     digitalWrite(20, HIGH); gpio20IsLow=false; PC_PRINTLN("[GPIO20] Set to HIGH (timeout recovery)");
     if(pendingRestartAfterError){
-      // 固定 6 秒待ち → AT 無期限プローブ開始
       pendingRestartAfterError=false;
       lcdPrintLine("Waiting 6s for module reboot...");
       logWrite("EVENT: GPIO20 HIGH; fixed 6s wait before AT probe");
@@ -617,34 +535,32 @@ void loop(){
       waitingModemReady = true;
       modemReadyWaitStartMs = millis();
       lastProbeMs = 0;
-      isRunning = false;                // コマンド実行は一時停止
-      waitingForCommandResponse = false;
-      uart1Enable();                    // 念のため有効化
+      isRunning = false; waitingForCommandResponse = false;
+      uart1Enable(); // 念のため
       lcdClearBeforeNewLine();
       lcdPrintLine("Probing: send AT until OK (no timeout)...");
       logWrite("EVENT: Start AT probing (wait OK, no timeout)");
-      Serial1.print("AT\r\n");          // 初回送信
+      Serial1.print("AT\r\n");
       lastProbeMs = millis();
       return;
     }
   }
 
-  /* ==== モジュール復帰待ち（AT→OK 無期限待ち） ==== */
+  /* ==== 復帰待ち（AT→OK） ==== */
   if (waitingModemReady) {
     unsigned long now = millis();
     if (now - lastProbeMs >= PROBE_INTERVAL_MS) {
       Serial1.print("AT\r\n");
       lastProbeMs = now;
     }
-    // タイムアウトなし：OK が来るまで待ち続ける
   }
 
-  /* ==== 自動実行（インターバル満了） ==== */
+  /* ==== 自動実行（インターバル） ==== */
   if(!isRunning && !waitingModemReady && (millis()-lastRunMillis >= RUN_INTERVAL_MS)){
     startRun();
   }
 
-  /* ==== レスポンスタイムアウト監視（すべて 10 秒） ==== */
+  /* ==== レスポンスタイムアウト監視 ==== */
   if(isRunning && waitingForCommandResponse &&
      (millis()-commandSentTime >= currentCommandTimeoutMs)){
     if(isCopsCommandActive && copsAttempts < COPS_MAX_ATTEMPTS){
@@ -670,22 +586,38 @@ void loop(){
   String resp;
   if(uart1GetLine(resp)){
     String printable=makePrintable(resp);
-    PC_PRINT("[RX<-UART1] "); PC_PRINTLN(printable);
+
+    // OK/ERROR 判定を先に
+    String line = printable; line.trim();
+    bool isOk = (line == "OK");
+    bool isError = (line == "ERROR");
+
+    // 2回目以降の ALLOCATE,1*** 例外：ERROR を完全無視（ログ・シリアル抑止）
+    bool suppressError = (isError && isRunning && waitingForCommandResponse && allocate1ExceptionActive());
+
+    if(!suppressError){
+      PC_PRINT("[RX<-UART1] "); PC_PRINTLN(printable);
+    }
+
     responseLineCount++;
     if(!isRunning && idleHoldDisplay) return;
 
-    // COPS: HEX 検知（延長はしない。ログのみ）
+    // COPS: HEX 検知（ログのみ）
     if(isCopsCommandActive && printable.indexOf('<')>=0){
       logWrite("COPS: hex-like stream detected");
     }
 
-    // 受信 %SOCKETDATA の汎用抽出
+    // %SOCKETDATA 抽出
     int rcid=0, rlen=0, rflags=0; String rpayloadRaw;
     if(parseSocketdataRx(printable, rcid, rlen, rflags, rpayloadRaw)){
-      String rpNorm = normalizePayloadForCompare_FromRx(rpayloadRaw);
+      String rpNorm;
+      if(isPureHexString(rpayloadRaw)){
+        rpNorm = makePrintable(hexToBytesString(rpayloadRaw));
+      }else{
+        rpNorm = makePrintable(rpayloadRaw);
+      }
       if(rpNorm.length()>26) rpNorm = rpNorm.substring(0,26);
-      receiveDataString = rpNorm;
-      hasReceiveData = true;
+      receiveDataString = rpNorm; hasReceiveData = true;
       PC_PRINTF("[INFO] RECEIVE cid=%d len=%d flags=%d payload_norm(<=26): %s\n", rcid, rlen, rflags, receiveDataString.c_str());
       logWrite(String("RECEIVE PAYLOAD (cid=")+rcid+", len="+rlen+", flags="+rflags+"): "+receiveDataString);
     }
@@ -709,12 +641,7 @@ void loop(){
       lcdPrintLine("RSP: "+d);
     }
 
-    // 完了判定（OK／ERROR）：完全一致＋URC分離
-    String line = printable; line.trim();
-    bool isOk    = (line == "OK");
-    bool isError = (line == "ERROR");
-
-    // 復帰待ち（AT→OK）完了フック
+    // 復帰待ち完了（AT->OK）
     if(isOk && waitingModemReady){
       waitingModemReady = false;
       logWrite("EVENT: Modem ready confirmed (AT -> OK)");
@@ -725,7 +652,7 @@ void loop(){
       return;
     }
 
-    // OK：成功（応答待ちのときのみ遷移）。待ちでなければ URC としてログのみ。
+    // OK 応答：通常遷移
     if(isOk){
       if (waitingForCommandResponse){
         waitingForCommandResponse=false;
@@ -741,17 +668,35 @@ void loop(){
       return;
     }
 
-    // ERROR：応答待ちのときだけリトライ。待ちでなければ URC として記録のみ。
+    // 例外：ALLOCATE,1*** の ERROR は完全スキップ
+    if(suppressError){
+      waitingForCommandResponse=false;
+      if(isCopsCommandActive) isCopsCommandActive=false;
+      currentLineIndex++;
+      advanceWhenReady();
+      yield();
+      return;
+    }
+
+    // 通常の ERROR 処理
     if(isError){
+      errorOccurredThisRun = true; // エラー扱い（ログ保存対象）
       if (!waitingForCommandResponse){
         logWrite(String("URC: ")+printable);
         yield();
         return;
       }
       logWrite(String("RSP: ")+printable);
+
       if(errorRetryAttempts < MAX_ERROR_RETRY){
+        // ALLOCATE の ERROR は再送前に 1 秒待機（例外に該当しない場合のみ）
+        if (currentCommandStr.startsWith("AT%SOCKETCMD=\"ALLOCATE\"")) {
+          PC_PRINTLN("[RETRY] ERROR on ALLOCATE -> wait 1000ms then retry");
+          logWrite("RETRY: ALLOCATE ERROR -> wait 1000ms before resend");
+          delay(1000);
+        }
         PC_PRINTF("[RETRY] ERROR received -> retry %d/%d (cmd=%s)\n",
-                  errorRetryAttempts+1, MAX_ERROR_RETRY, currentCommandStr.c_str());
+          errorRetryAttempts+1, MAX_ERROR_RETRY, currentCommandStr.c_str());
         logWrite(String("ERROR: retry ")+String(errorRetryAttempts+1)+"/"+String(MAX_ERROR_RETRY));
         Serial1.print(currentCommandStr); Serial1.print("\r\n");
         errorRetryAttempts++;
@@ -779,6 +724,7 @@ void loop(){
       }
     }
 
+    // その他の行はログへ
     logWrite(String("RSP: ")+printable);
     yield();
   }

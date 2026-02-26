@@ -1,10 +1,9 @@
-
 /*
  * ESP32-C6: LittleFS の /commands1.txt から AT コマンドを順次実行（UART1）
  * - LCD（LovyanGFX/ST7789）へ CMD/RSP 表示、WS2812 で結果表示
  * - ログ: /logs/atlog_YYYYMMDD_HHMMSS.txt（+CCLK 時刻／なければ millis）
  * - PC→ESP32: #LIST / #GET <path> / #DELLOG（FILEBEGIN size + 本体 + FILEEND）
- *
+ * 
  * 主要仕様（2026-01-15版 + 要望反映）
  * - 全 AT コマンドの個別タイムアウトは 10 秒に統一（COPS も 10s/試行・延長なし）
  * - コマンド間の待ち時間は 1,000ms（advanceWhenReady）
@@ -17,6 +16,12 @@
  * - AT%SOCKETCMD="ALLOCATE" の ERROR リトライ前は 1 秒待機
  * - 2回目以降は AT%SOCKETCMD="ALLOCATE",1*** の ERROR を完全無視（ログ/シリアル出力せずに次へ）
  * - 実行間隔は30min
+ *
+ * === 追加機能（今回）===
+ * - ESP32-C6 自身を SoftAP として起動（固定SSID/パス）
+ * - AP側IPを 192.168.4.1 に固定（softAPConfig）
+ * - Webサーバーで Pass/NG を表示（/ と /json）
+ * - delay中もWebが固まらないよう smartDelay を導入（主要 delay を置換）
  */
 
 #include <Arduino.h>
@@ -27,12 +32,16 @@
 #include <vector>
 #include "lte_mod.h"
 
+// ★追加：Wi-Fi (SoftAP) + WebServer
+#include <WiFi.h>
+#include <WebServer.h>
+
 #if defined(ESP32)
   #include "freertos/FreeRTOS.h"
   #include "freertos/portmacro.h"
   portMUX_TYPE gp23Mux = portMUX_INITIALIZER_UNLOCKED;
   #ifndef IRAM_ATTR
-  #define IRAM_ATTR
+    #define IRAM_ATTR
   #endif
 #endif
 
@@ -42,7 +51,7 @@ bool pcTransferActive = false;
 #define PC_PRINTLN(s)  do{ if(!pcTransferActive) Serial.println(s); } while(0)
 #define PC_PRINTF(...) do{ if(!pcTransferActive) Serial.printf(__VA_ARGS__); } while(0)
 
-#define RGB_PIN   8
+#define RGB_PIN 8
 #define RGB_COUNT 1
 Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_RGB + NEO_KHZ800);
 inline void rgbSet(uint8_t r, uint8_t g, uint8_t b){ rgb.setPixelColor(0, rgb.Color(r,g,b)); rgb.show(); }
@@ -75,8 +84,8 @@ unsigned long lastRunMillis=0;
 
 /* ==== タイムアウト・間隔 ==== */
 const unsigned long COMMAND_RESPONSE_TIMEOUT_MS = 10000UL; // 10s
-const unsigned long RUN_INTERVAL_MS            = 1800000UL;  // 周期実行間隔 (30 min x 60,000 msec)
-const unsigned long INTER_CMD_DELAY_MS         = 1000UL;   // コマンド間
+const unsigned long RUN_INTERVAL_MS = 1800000UL; // 周期実行間隔 (30 min)
+const unsigned long INTER_CMD_DELAY_MS = 1000UL; // コマンド間
 uint32_t ngCountRun=0, passCountRun=0;
 
 /* ==== ERROR 復帰用 GPIO20 ==== */
@@ -101,7 +110,7 @@ static bool swDebouncing = false;
 static unsigned long swDebounceStartMs = 0;
 static unsigned long lastSwitchHandledMs = 0;
 const unsigned long SWITCH_DEBOUNCE_MS = 30;
-const unsigned long SWITCH_LOCK_MS     = 5000;
+const unsigned long SWITCH_LOCK_MS = 5000;
 
 void IRAM_ATTR gp23_isr(){
 #if defined(ESP32)
@@ -113,10 +122,120 @@ void IRAM_ATTR gp23_isr(){
 #endif
 }
 
+/* ==================== ★ SoftAP + WebServer（固定SSID/パス + 固定IP 192.168.4.1） ==================== */
+static const char* AP_SSID = "ESP32C6_ATCHECK";
+static const char* AP_PASS = "12345678"; // 固定。8文字以上推奨。
+
+WebServer server(80);
+static bool webStarted = false;
+
+static String boolStr(bool v){ return v ? "true" : "false"; }
+
+void handleRoot() {
+  String html;
+  html.reserve(900);
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='2'>";
+  html += "<title>AT Checker</title></head><body style='font-family:system-ui;'>";
+  html += "<h2>AT Checker Status</h2>";
+  html += "<p><b>Pass</b>: " + String((unsigned long)passCountRun) + "</p>";
+  html += "<p><b>NG</b>: "   + String((unsigned long)ngCountRun)   + "</p>";
+  html += "<hr>";
+  html += "<p>isRunning: " + boolStr(isRunning) + "</p>";
+  html += "<p>waitingModemReady: " + boolStr(waitingModemReady) + "</p>";
+  html += "<p>pcTransferActive: " + boolStr(pcTransferActive) + "</p>";
+  //html += "<p>uptime(s): " + String(millis()/1000) + "</p>";
+  // 次回開始までのカウントダウン表示
+  if (!isRunning && !waitingModemReady) {
+    unsigned long elapsed = millis() - lastRunMillis;
+    unsigned long remainMs = (elapsed >= RUN_INTERVAL_MS) ? 0 : (RUN_INTERVAL_MS - elapsed);
+
+    unsigned long remainSec = remainMs / 1000;
+    unsigned long mm = remainSec / 60;
+    unsigned long ss = remainSec % 60;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lu:%02lu", mm, ss);
+    html += "<p><b>Next run in</b>: " + String(buf) + "</p>";
+  } else {
+    // 実行中や復帰待ち中はカウントダウン不可（仕様上、次回は「完了後+30分」なので）
+    html += "<p><b>Next run in</b>: (running)</p>";
+  }
+
+  if(hasRsrpInfo && rsrpInfo.length()>0) html += "<p> " + rsrpInfo + "</p>";
+  else if(hasLastRsrp && lastRsrpInfo.length()>0) html += "<p>RSRP(last): " + lastRsrpInfo + "</p>";
+  else html += "<p>RSRP: N/A</p>";
+  html += "<p><a href='/json'>/json</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleJson() {
+  String json;
+  json.reserve(256);
+  json += "{";
+  json += "\"pass\":" + String((unsigned long)passCountRun) + ",";
+  json += "\"ng\":" + String((unsigned long)ngCountRun) + ",";
+  json += "\"isRunning\":" + boolStr(isRunning) + ",";
+  json += "\"waitingModemReady\":" + boolStr(waitingModemReady) + ",";
+  json += "\"pcTransferActive\":" + boolStr(pcTransferActive) + ",";
+  json += "\"uptime_s\":" + String(millis()/1000);
+  json += "}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void startSoftAPandServer() {
+  WiFi.mode(WIFI_AP);
+
+  // ★ AP側IPを固定（192.168.4.1）
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway (192, 168, 4, 1);
+  IPAddress subnet  (255, 255, 255, 0);
+  if (!WiFi.softAPConfig(local_ip, gateway, subnet)) {
+    Serial.println("[AP] softAPConfig failed (static IP may not apply)");
+  }
+
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+  if (!ok) {
+    Serial.println("[AP] softAP failed");
+    webStarted = false;
+    return;
+  }
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("[AP] SSID=%s IP=%s\n", AP_SSID, ip.toString().c_str());
+
+  server.on("/", handleRoot);
+  server.on("/json", handleJson);
+  server.begin();
+  webStarted = true;
+  Serial.println("[Web] Server started. Open: http://192.168.4.1/");
+}
+
+inline void webLoop() {
+  if (webStarted) server.handleClient();
+}
+
+/* ==================== forward declarations（smartDelayで呼ぶため） ==================== */
+void handlePcSerialCommands();
+void handlePauseSwitchIrqDriven();
+
+/* ==================== ★ smartDelay：delay中もWeb/シリアル処理を回す ==================== */
+void smartDelay(uint32_t ms){
+  unsigned long st = millis();
+  while(millis() - st < ms){
+    webLoop();
+    handlePcSerialCommands();
+    handlePauseSwitchIrqDriven();
+    delay(2);
+    yield();
+  }
+}
+
 /* ==================== ログ（LittleFS） ==================== */
 String logFilePath=""; fs::File logFile; bool logReady=false;
 bool hasClockFromModem=false; String currentClockStr="";
-
 bool ensureFS(){ if(!LittleFS.begin(true)){ PC_PRINTLN("[ERROR] Failed to mount LittleFS"); return false; } return true; }
 static String pad2(int v){ String s=String(v); if(s.length()<2) s="0"+s; return s; }
 
@@ -146,7 +265,6 @@ void openNewLog(){
   logFile.printf("=== AT Log start ===\nfile: %s\n", logFilePath.c_str());
   logFile.flush();
 }
-
 void closeLog(){ if(logReady){ logFile.printf("=== AT Log end ===\n"); logFile.flush(); logFile.close(); logReady=false; } }
 
 String nowStamp(){
@@ -174,7 +292,6 @@ void lcdClearBeforeNewLine(bool drawHeader=true){ lcd.fillScreen(TFT_BLACK); cur
 void lcdNewLine(){ cursorX=margin; cursorY+=lineHeight; if(cursorY>lcd.height()-margin-lineHeight) lcdClearBeforeNewLine(); }
 void lcdPrintLine(const String& line){ lcd.setCursor(cursorX,cursorY); lcd.print(line); lcdNewLine(); }
 
-
 /* ==================== UART1 制御 ==================== */
 static const uint32_t BAUD_PC=115200, BAUD_UART=115200;
 static const int UART1_TX_PIN=18, UART1_RX_PIN=19;
@@ -182,6 +299,7 @@ void uart1Enable(){ Serial1.begin(BAUD_UART, SERIAL_8N1, UART1_RX_PIN, UART1_TX_
 void uart1Disable(){ Serial1.end(); PC_PRINTLN("[UART1] Disabled"); }
 
 /* ==================== GP23: 中断/再開 ==================== */
+void startRun(); // forward
 void pauseProcessing(){
   if (userPauseEnabled) return;
   userPauseEnabled = true;
@@ -267,31 +385,33 @@ void showIdleNextRunScreen(){
 
 /* ==================== 実行サイクル（ログ保存ポリシー含む） ==================== */
 bool errorOccurredThisRun = false; // ラン単位エラーフラグ（AT ERROR / MISMATCH / INCOMPLETE）
+void sendNextCommand(); // forward
 
 void startRun(){
   idleHoldDisplay=false; hasSendData=false; hasReceiveData=false; hasRsrpInfo=false; rsrpInfo="";
   waitingForCommandResponse=false; showIdle();
   lcdClearBeforeNewLine(); lcdPrintLine("Loading commands...");
+
   runCycleCount++;
   errorOccurredThisRun = false;
-
   loadCommandFile();
 
   int startIndex = 0;
   if (runCycleCount >= 2) { startIndex = (step2StartIndexCache >= 0 ? step2StartIndexCache : 0); }
   currentLineIndex = startIndex;
 
-  if (runCycleCount == 1) { lcdPrintLine("Start: from TOP");      logWrite("RUN START: from TOP"); }
+  if (runCycleCount == 1) { lcdPrintLine("Start: from TOP"); logWrite("RUN START: from TOP"); }
   else {
-    if (startIndex > 0)   { lcdPrintLine("Start: from #STEP2");   logWrite("RUN START: from #STEP2"); }
-    else                  { lcdPrintLine("Start: #STEP2 not found -> TOP"); logWrite("RUN START: #STEP2 not found -> TOP"); }
+    if (startIndex > 0) { lcdPrintLine("Start: from #STEP2"); logWrite("RUN START: from #STEP2"); }
+    else { lcdPrintLine("Start: #STEP2 not found -> TOP"); logWrite("RUN START: #STEP2 not found -> TOP"); }
   }
 
   uart1Enable();
-  isRunning=true; delay(300);
+  isRunning=true; smartDelay(300);
   openNewLog(); logWrite("RUN START");
   sendNextCommand();
 }
+
 void finishRun(){
   uart1Disable();
   isRunning=false; lastRunMillis=millis();
@@ -301,8 +421,9 @@ void finishRun(){
   closeLog();
 
   // ログ保存ポリシー：エラー（AT ERROR / MISMATCH / INCOMPLETE）なら保存、なければ削除
-  if (!ensureFS()) return;
-  if (logFilePath.length() == 0) return;
+  if(!ensureFS()) return;
+  if(logFilePath.length() == 0) return;
+
   if (errorOccurredThisRun) {
     if (logFilePath.indexOf("/logs/error_log_") == 0) {
       PC_PRINTLN("[LOG] Error occurred; file already named with error_log_ (kept)");
@@ -311,34 +432,37 @@ void finishRun(){
       String newPath = String("/logs/error_log_") + baseName;
       bool ok = LittleFS.rename(logFilePath, newPath);
       if (ok) { PC_PRINTF("[LOG] Error occurred; renamed to: %s\n", newPath.c_str()); logFilePath = newPath; }
-      else    { PC_PRINTF("[ERROR] Failed to rename log to: %s (kept original)\n", newPath.c_str()); }
+      else { PC_PRINTF("[ERROR] Failed to rename log to: %s (kept original)\n", newPath.c_str()); }
     }
   } else {
     if (LittleFS.exists(logFilePath)) {
       bool ok = LittleFS.remove(logFilePath);
       if (ok) PC_PRINTF("[LOG] No error; log removed: %s\n", logFilePath.c_str());
-      else    PC_PRINTF("[ERROR] Failed to remove log: %s\n", logFilePath.c_str());
+      else PC_PRINTF("[ERROR] Failed to remove log: %s\n", logFilePath.c_str());
     }
   }
 }
+
 void restartFromTop(){
   PC_PRINTLN("[RESTART] Restarting from line 1");
   idleHoldDisplay=false; isRunning=true; waitingForCommandResponse=false;
   hasSendData=false; hasReceiveData=false; hasRsrpInfo=false; rsrpInfo="";
   sendDataString=""; receiveDataString=""; currentLineIndex=0;
   lcdClearBeforeNewLine(true); lcdPrintLine("Restarting from line 1...");
-  loadCommandFile(); delay(300);
+  loadCommandFile(); smartDelay(300);
   logWrite("RESTART FROM TOP");
   uart1Enable();
   sendNextCommand();
 }
 
 /* ==================== コマンド送出 ==================== */
-void advanceWhenReady(){ delay(INTER_CMD_DELAY_MS); sendNextCommand(); }
+void advanceWhenReady(){ smartDelay(INTER_CMD_DELAY_MS); sendNextCommand(); }
+
 void sendNextCommand(){
   if(!commandsLoaded || currentLineIndex >= (int)commandLines.size()){
     PC_PRINTLN("[INFO] All commands completed");
     bool rsrpObtained = (hasRsrpInfo || hasLastRsrp);
+
     if (hasSendData && hasReceiveData && rsrpObtained) {
       showMatch(); passCountRun++;
       logWrite("RESULT: PASS_BY_COMPLETION (send/receive/RSRP obtained)");
@@ -348,25 +472,25 @@ void sendNextCommand(){
           showMatch(); passCountRun++; logWrite("RESULT: MATCH");
         } else {
           showMismatch(); ngCountRun++; logWrite("RESULT: MISMATCH");
-          errorOccurredThisRun = true;  // MISMATCH をエラー扱い
+          errorOccurredThisRun = true;
         }
       } else {
         logWrite("RESULT: INCOMPLETE (missing send/receive and/or RSRP)");
         showMismatch(); ngCountRun++;
-        errorOccurredThisRun = true;    // INCOMPLETE もエラー扱い
+        errorOccurredThisRun = true;
       }
     }
     finishRun(); return;
   }
 
   String command=commandLines[currentLineIndex];
-
   if(command.startsWith("#")){ currentLineIndex++; sendNextCommand(); return; } // コメント
+
   if(command.startsWith("WAIT")){
     int sp = command.indexOf(' '); unsigned long waitMs = 0;
     if(sp > 0){ String msStr = command.substring(sp+1); msStr.trim(); waitMs = (unsigned long)msStr.toInt(); }
     lcdClearBeforeNewLine(); lcdPrintLine(String("WAIT ") + waitMs + " ms...");
-    delay(waitMs);
+    smartDelay(waitMs);
     currentLineIndex++; sendNextCommand(); return;
   }
 
@@ -385,6 +509,7 @@ void sendNextCommand(){
   lcdClearBeforeNewLine(); lcdPrintLine("CMD: "+command);
   PC_PRINTF("[TX->UART1] %s\n", command.c_str());
   Serial1.print(command); Serial1.print("\r\n");
+
   currentCommandStr = command;
   waitingForCommandResponse=true;
   commandSentTime=millis();
@@ -425,6 +550,7 @@ void handlePcSerialCommands(){
         while(f){ Serial.printf("LIST:%s:%u\r\n", f.path(), (unsigned)f.size()); f=root.openNextFile(); }
         root.close(); Serial.print("LISTEND\r\n"); return;
       }
+
       if(cmd.startsWith("#GET ")){
         String path=cmd.substring(5); path.trim();
         fs::File f=LittleFS.open(path,"r");
@@ -433,20 +559,35 @@ void handlePcSerialCommands(){
         size_t sz=f.size();
         Serial.printf("FILEBEGIN %s %u\r\n", path.c_str(), (unsigned)sz);
         uint8_t buf[1024];
-        while(f.available()){ size_t n=f.read(buf,sizeof(buf)); Serial.write(buf,n); yield(); }
+        while(f.available()){
+          size_t n=f.read(buf,sizeof(buf));
+          Serial.write(buf,n);
+          yield();
+          webLoop();
+        }
         f.close();
         Serial.print("FILEEND\r\n");
         pcTransferActive=false; return;
       }
+
       if(cmd=="#DELLOG"){
         fs::File root=LittleFS.open("/logs");
         if(!root || !root.isDirectory()){ Serial.print("DELLOG:EMPTY\r\n"); return; }
         size_t files=0, bytes=0;
         fs::File f=root.openNextFile();
-        while(f){ String path=f.path(); size_t sz=f.size(); f.close(); if(LittleFS.remove(path)){ files++; bytes+=sz; } f=root.openNextFile(); }
-        root.close(); LittleFS.mkdir("/logs");
+        while(f){
+          String path=f.path(); size_t sz=f.size();
+          f.close();
+          if(LittleFS.remove(path)){ files++; bytes+=sz; }
+          f=root.openNextFile();
+          yield();
+          webLoop();
+        }
+        root.close();
+        LittleFS.mkdir("/logs");
         Serial.printf("DELLOG:OK %u %u\r\n",(unsigned)files,(unsigned)bytes); return;
       }
+
       Serial.print("ERR:unknown cmd\r\n");
     }else{
       line+=c;
@@ -454,15 +595,17 @@ void handlePcSerialCommands(){
   }
 }
 
-/* ==================== UART1受信（行確定）…通常関数として定義 ==================== */
+/* ==================== UART1受信（行確定） ==================== */
 static std::vector<uint8_t> uart1Buf;
 static uint32_t uart1LastByteMs=0;
 static const uint32_t UART1_GAP_MS=15;
 
 bool uart1GetLine(String &out){
   bool got=false;
+
   // 復帰待ち中も受信を見る
   if(!isRunning && !waitingModemReady) return false;
+
   while(Serial1.available()){
     uint8_t b=(uint8_t)Serial1.read(); uart1LastByteMs=millis();
     if(b=='\r') continue;
@@ -482,6 +625,7 @@ bool uart1GetLine(String &out){
       return true;
     }
   }
+
   if(!uart1Buf.empty()){
     uint32_t now=millis();
     if(now - uart1LastByteMs >= UART1_GAP_MS){
@@ -496,28 +640,49 @@ bool uart1GetLine(String &out){
 
 /* ==================== setup / loop ==================== */
 void setup(){
-  Serial.begin(115200); delay(300);
-  ensureFS(); LittleFS.mkdir("/logs");
-  pinMode(20, OUTPUT); digitalWrite(20, HIGH); PC_PRINTLN("[GPIO20] Set to HIGH");
+  Serial.begin(115200);
+  smartDelay(300);
+
+  ensureFS();
+  LittleFS.mkdir("/logs");
+
+  pinMode(20, OUTPUT);
+  digitalWrite(20, HIGH);
+  PC_PRINTLN("[GPIO20] Set to HIGH");
+
   pinMode(GP23_SWITCH_PIN, INPUT_PULLUP);
   attachInterrupt(GP23_SWITCH_PIN, gp23_isr, FALLING);
 
-  delay(2000); // LCD 初期化前待機
+  smartDelay(2000); // LCD 初期化前待機
   lcd.begin(); lcd.setRotation(1); lcd.setBrightness(220);
   lcd.setFont(&fonts::Font4); lcd.setTextSize(textSize);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
   lcd.setTextDatum(textdatum_t::top_left);
   lineHeight=lcd.fontHeight()*textSize;
+  lcdClearBeforeNewLine();
+  lcdPrintLine("READY - Log + Transfer (interval, UART1 off in idle)");
 
-  lcdClearBeforeNewLine(); lcdPrintLine("READY - Log + Transfer (interval, UART1 off in idle)");
   rgb.begin(); rgb.show(); showIdle();
 
-  delay(3000); // LCD 初期化前待機
+  // ★ SoftAP + WebServer 起動（固定SSID/パス + 固定IP 192.168.4.1）
+  lcdPrintLine("Starting AP/Web...");
+  startSoftAPandServer();
+  if (webStarted) {
+    lcdPrintLine(String("AP: ") + AP_SSID);
+    lcdPrintLine(String("IP: 192.168.4.1"));
+  } else {
+    lcdPrintLine("AP/Web start failed");
+  }
+
+  smartDelay(3000); // LCD 初期化後待機（必要なら短縮可）
   lastRunMillis=millis();
   startRun();
 }
 
 void loop(){
+  // ★最優先：Web応答（早期returnが多いので先頭で回す）
+  webLoop();
+
   handlePcSerialCommands();
   if(pcTransferActive) return;
 
@@ -526,17 +691,23 @@ void loop(){
 
   /* ==== GPIO20 自動復帰（LOW→約1秒→HIGH） ==== */
   if(gpio20IsLow && (millis()-gpio20LowTime >= GPIO20_LOW_DURATION_MS)){
-    digitalWrite(20, HIGH); gpio20IsLow=false; PC_PRINTLN("[GPIO20] Set to HIGH (timeout recovery)");
+    digitalWrite(20, HIGH);
+    gpio20IsLow=false;
+    PC_PRINTLN("[GPIO20] Set to HIGH (timeout recovery)");
+
     if(pendingRestartAfterError){
       pendingRestartAfterError=false;
       lcdPrintLine("Waiting 6s for module reboot...");
       logWrite("EVENT: GPIO20 HIGH; fixed 6s wait before AT probe");
-      delay(6000);
+      smartDelay(6000); // ★Webが固まらない待ち
+
       waitingModemReady = true;
       modemReadyWaitStartMs = millis();
       lastProbeMs = 0;
       isRunning = false; waitingForCommandResponse = false;
+
       uart1Enable(); // 念のため
+
       lcdClearBeforeNewLine();
       lcdPrintLine("Probing: send AT until OK (no timeout)...");
       logWrite("EVENT: Start AT probing (wait OK, no timeout)");
@@ -565,7 +736,7 @@ void loop(){
      (millis()-commandSentTime >= currentCommandTimeoutMs)){
     if(isCopsCommandActive && copsAttempts < COPS_MAX_ATTEMPTS){
       PC_PRINTF("[COPS] Timeout after %lu ms -> retry %d/%d (no extension)\n",
-        (unsigned long)currentCommandTimeoutMs, copsAttempts+1, COPS_MAX_ATTEMPTS);
+                (unsigned long)currentCommandTimeoutMs, copsAttempts+1, COPS_MAX_ATTEMPTS);
       logWrite(String("TIMEOUT: COPS ")+String(currentCommandTimeoutMs/1000)+"s, retry "+String(copsAttempts+1)+"/"+String(COPS_MAX_ATTEMPTS));
       Serial1.print(currentCommandStr); Serial1.print("\r\n");
       copsAttempts++;
@@ -594,7 +765,6 @@ void loop(){
 
     // 2回目以降の ALLOCATE,1*** 例外：ERROR を完全無視（ログ・シリアル抑止）
     bool suppressError = (isError && isRunning && waitingForCommandResponse && allocate1ExceptionActive());
-
     if(!suppressError){
       PC_PRINT("[RX<-UART1] "); PC_PRINTLN(printable);
     }
@@ -623,7 +793,11 @@ void loop(){
     }
 
     // +CCLK
-    if(printable.indexOf("+CCLK:")>=0){ currentClockStr=printable; hasClockFromModem=true; logWrite(String("CLOCK UPDATE: ")+printable); }
+    if(printable.indexOf("+CCLK:")>=0){
+      currentClockStr=printable;
+      hasClockFromModem=true;
+      logWrite(String("CLOCK UPDATE: ")+printable);
+    }
 
     // RSRP
     if(printable.indexOf("RSRP: Reported")>=0){
@@ -646,7 +820,7 @@ void loop(){
       waitingModemReady = false;
       logWrite("EVENT: Modem ready confirmed (AT -> OK)");
       lcdPrintLine("Modem ready. Restarting sequence...");
-      delay(200);
+      smartDelay(200);
       restartFromTop();
       yield();
       return;
@@ -686,6 +860,7 @@ void loop(){
         yield();
         return;
       }
+
       logWrite(String("RSP: ")+printable);
 
       if(errorRetryAttempts < MAX_ERROR_RETRY){
@@ -693,10 +868,11 @@ void loop(){
         if (currentCommandStr.startsWith("AT%SOCKETCMD=\"ALLOCATE\"")) {
           PC_PRINTLN("[RETRY] ERROR on ALLOCATE -> wait 1000ms then retry");
           logWrite("RETRY: ALLOCATE ERROR -> wait 1000ms before resend");
-          delay(1000);
+          smartDelay(1000);
         }
+
         PC_PRINTF("[RETRY] ERROR received -> retry %d/%d (cmd=%s)\n",
-          errorRetryAttempts+1, MAX_ERROR_RETRY, currentCommandStr.c_str());
+                  errorRetryAttempts+1, MAX_ERROR_RETRY, currentCommandStr.c_str());
         logWrite(String("ERROR: retry ")+String(errorRetryAttempts+1)+"/"+String(MAX_ERROR_RETRY));
         Serial1.print(currentCommandStr); Serial1.print("\r\n");
         errorRetryAttempts++;
@@ -709,10 +885,12 @@ void loop(){
         waitingForCommandResponse=false;
         if(isCopsCommandActive){ isCopsCommandActive=false; }
         ngCountRun++; showMismatch();
+
         if(!gpio20IsLow){
           digitalWrite(20,LOW); gpio20IsLow=true; gpio20LowTime=millis();
           PC_PRINTLN("[GPIO20] LOW (ERROR reset sequence started)");
         }
+
         pendingRestartAfterError=true;
         lcdClearBeforeNewLine();
         lcdPrintLine("RSP: ERROR (max retries). Reset GPIO20 -> wait 6s");
